@@ -1,0 +1,9 @@
+apiVersion: serving.llmlab.dev/v1alpha1
+kind: ModelDeployment
+metadata:
+  labels:
+    app.kubernetes.io/name: llm-serving-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: modeldeployment-sample
+spec:
+  # TODO(user): Add fields here
