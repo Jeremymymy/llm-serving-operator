@@ -178,7 +178,7 @@ git commit -m "chore: scaffold with kubebuilder"
 
 ## 完成條件
 
-- [ ] 四個工具版本已記進 `RESULTS.md`
-- [ ] `kubectl get nodes` 看得到 `operator-lab-control-plane` Ready
-- [ ] `make test` 通過
-- [ ] scaffold commit 已建立，`README.md` 是這個 lab 的版本（不是 kubebuilder 產生的）
+- [x] 四個工具版本已記進 `RESULTS.md`
+- [x] `kubectl get nodes` 看得到 `operator-lab-control-plane` Ready
+- [x] `make test` 通過
+- [x] scaffold commit 已建立，`README.md` 是這個 lab 的版本（不是 kubebuilder 產生的）

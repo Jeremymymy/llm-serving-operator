@@ -66,6 +66,7 @@ status:
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime" // scaffold 原本就有，init() 的 SchemeBuilder.Register 要用，不能拿掉
 )
 
 // ModelSource 描述模型檔從哪裡來、存成什麼名字。
@@ -141,6 +142,9 @@ type ModelDeploymentStatus struct {
 
 > **scaffold 可能不同的地方**：較新版 kubebuilder 的 scaffold 在 Status 裡**已經**有 `Conditions` 欄位，`ModelDeployment` 的 `Status` 欄位 json tag 是 `omitzero`（v4.16.0 實測如此）。
 > 以上面的 struct 整個取代即可；`ModelDeployment` struct 本身（`Spec`、`Status` 兩個欄位的宣告）照 scaffold 的寫法保留。
+> scaffold 的 Spec 裡有一個範例欄位 `Foo *string`，整個取代時它會一起消失，這是預期的。
+
+> ⚠️ **改完型別到 Part 3 之前，不要跑 `make test`**：scaffold 原本的測試會建立一個 spec 是空的 CR。現在 `model.url`、`model.file` 變成必填，API server 會拒絕它，所以測試一定失敗。Part 3 會把整份測試換掉。
 
 `priority=1` 的欄位只在 `kubectl get md -o wide` 才顯示 —— endpoint 太長，平常不想佔版面。
 
@@ -434,12 +438,13 @@ func (r *ModelDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 ```
 
 ```bash
-go mod tidy          # k8s.io/utils/ptr 等套件已是間接相依，這步把它們變成直接相依
+go mod tidy          # k8s.io/api、k8s.io/utils 在 scaffold 的 go.mod 裡是 // indirect，這步把它們變成直接相依
 make manifests       # RBAC marker → config/rbac/role.yaml
 go build ./...
 ```
 
 打開 `config/rbac/role.yaml`，確認裡面**只有**上面 marker 宣告的五組權限。
+scaffold 本來就有 `modeldeployments`、`modeldeployments/status`、`modeldeployments/finalizers` 三組，所以 role.yaml 會從 3 條 rule 變成 5 條，新增的是 `apps` 的 `deployments` 與 core group（`""`）的 `services`。
 
 ### 2.3 讀懂四個關鍵判斷
 
@@ -609,9 +614,15 @@ var _ = Describe("ModelDeployment Controller", func() {
 make test
 ```
 
-**完成條件**：全部通過（Ginkgo 會顯示 `Ran 9 of 9 Specs`：4 個 `It` 加上 `DescribeTable` 的 5 個 `Entry`）。記下測試數量與 `internal/controller` 的覆蓋率。
+**完成條件**：全部通過，記下測試數量與 `internal/controller` 的覆蓋率。
 
-> 想看每個 spec 名稱：`go test ./internal/controller/ -v -count=1`（`make test` 會先產生 envtest 執行檔，第一次要先跑過 `make test`）。
+`make test` 沒有加 `-v`，測試通過時只會印 `ok` 與覆蓋率，看不到測試數量。要看數量，另外跑：
+
+```bash
+go test ./internal/controller/ -v -count=1    # 應該看到 Ran 9 of 9 Specs：4 個 It 加上 DescribeTable 的 5 個 Entry
+```
+
+> 不用另外設 `KUBEBUILDER_ASSETS`：scaffold 的 `suite_test.go` 會自己去 `bin/k8s/` 找 envtest 執行檔。前提是 `make test` 至少跑過一次，執行檔已經下載好。
 
 > 失敗時先看是哪一類：
 > - 驗證測試失敗 → 多半是 marker 沒產生進 CRD，重跑 `make manifests` 再看 CRD YAML
@@ -624,7 +635,7 @@ make test
 
 ### 4.1 範例 CR
 
-把 `config/samples/serving_v1alpha1_modeldeployment.yaml` 換成：
+把 `config/samples/serving_v1alpha1_modeldeployment.yaml` 整個換成下面這份。scaffold 版本的名字是 `modeldeployment-sample`，還帶了兩個 label；換掉之後名字是 `smollm`，後面的實驗都靠這個名字找資源：
 
 ```yaml
 apiVersion: serving.llmlab.dev/v1alpha1
@@ -665,6 +676,11 @@ kubectl get md -w                 # 看 Ready 從空白 → 1、Available False 
 kubectl get pods -l app.kubernetes.io/instance=smollm -w
 kubectl logs -l app.kubernetes.io/instance=smollm -c fetch-model   # 下載過程
 ```
+
+> **第一次要等好幾分鐘**：init container 先下載模型（約 1 分鐘），之後節點才開始拉 `llama.cpp:server` image，這一步可能要好幾分鐘。這段期間 pod 會停在 `PodInitializing`，md 會一直是 `Available=False`，這是正常的。
+> 想知道卡在哪一步，看 pod 的 Events：`kubectl describe pod -l app.kubernetes.io/instance=smollm | tail -15`。最後一行如果是 `Pulling image "ghcr.io/ggml-org/llama.cpp:server"`，代表還在拉 image。
+>
+> `make run` 剛啟動時，log 可能連續出現好幾次 `deployment: updated`，甚至有一次 `the object has been modified` 的 409 錯誤，下一輪重試就會成功。原因和實驗 7 相同，先記下來就好。
 
 ### 4.3 打一個推論請求
 
@@ -805,9 +821,9 @@ git commit -m "feat: ModelDeployment CRD and reconcile for Deployment/Service"
 
 ## 完成條件
 
-- [ ] `make test` 全過，測試數量與覆蓋率已記錄
-- [ ] `kubectl get md` 看到 Available=True，curl 推論有回應
-- [ ] 八個實驗都有紀錄（指令、關鍵輸出、時間）
-- [ ] 實驗 1 的錯誤訊息原文已貼進 RESULTS
-- [ ] 實驗 7 的 log 與 resourceVersion 結果已記錄
-- [ ] 有任何跟預期不同的地方，寫進 RESULTS 的「與預期不同」
+- [x] `make test` 全過，測試數量與覆蓋率已記錄
+- [x] `kubectl get md` 看到 Available=True，curl 推論有回應
+- [x] 八個實驗都有紀錄（指令、關鍵輸出、時間）
+- [x] 實驗 1 的錯誤訊息原文已貼進 RESULTS
+- [x] 實驗 7 的 log 與 resourceVersion 結果已記錄
+- [x] 有任何跟預期不同的地方，寫進 RESULTS 的「與預期不同」

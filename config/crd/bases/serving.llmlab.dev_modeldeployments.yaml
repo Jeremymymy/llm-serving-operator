@@ -11,10 +11,29 @@ spec:
     kind: ModelDeployment
     listKind: ModelDeploymentList
     plural: modeldeployments
+    shortNames:
+    - md
     singular: modeldeployment
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.runtime
+      name: Runtime
+      type: string
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Available")].status
+      name: Available
+      type: string
+    - jsonPath: .status.endpoint
+      name: Endpoint
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ModelDeployment is the Schema for the modeldeployments API
@@ -39,25 +58,105 @@ spec:
           spec:
             description: spec defines the desired state of ModelDeployment
             properties:
-              foo:
-                description: foo is an example field of ModelDeployment. Edit modeldeployment_types.go
-                  to remove/update
+              image:
+                description: Image 覆蓋預設的推論 image。
                 type: string
+              model:
+                description: Model 是要載入的模型。
+                properties:
+                  file:
+                    description: |-
+                      File 是存進容器 /models 底下的檔名。
+                      只允許英數、點、底線、連字號，且必須以 .gguf 結尾 —— 擋掉路徑穿越。
+                    pattern: ^[A-Za-z0-9._-]+\.gguf$
+                    type: string
+                  url:
+                    description: URL 是 GGUF 檔的下載位址。只接受 https。
+                    pattern: ^https://
+                    type: string
+                required:
+                - file
+                - url
+                type: object
+              replicas:
+                default: 1
+                description: Replicas 是推論 pod 數量。可以是 0（停用但保留設定）。
+                format: int32
+                minimum: 0
+                type: integer
+              resources:
+                description: Resources 覆蓋推論容器預設的 requests/limits。
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              runtime:
+                default: llamacpp
+                description: Runtime 是推論引擎。目前只支援 llamacpp。
+                enum:
+                - llamacpp
+                type: string
+            required:
+            - model
             type: object
           status:
             description: status defines the observed state of ModelDeployment
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the ModelDeployment resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions 依 Kubernetes 慣例表達狀態，目前只有 Available。
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +215,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              endpoint:
+                description: Endpoint 是叢集內呼叫推論服務的網址。
+                type: string
+              observedGeneration:
+                description: ObservedGeneration 是 controller 最後處理過的 metadata.generation。
+                format: int64
+                type: integer
+              readyReplicas:
+                description: ReadyReplicas 是通過 readiness probe 的 pod 數量。
+                format: int32
+                type: integer
             type: object
         required:
         - spec

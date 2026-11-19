@@ -21,67 +21,130 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	servingv1alpha1 "github.com/Jeremymymy/llm-serving-operator/api/v1alpha1"
 )
 
 var _ = Describe("ModelDeployment Controller", func() {
-	Context("When reconciling a resource", func() {
-		const (
-			resourceName      = "test-resource"
-			resourceNamespace = "default"
-		)
+	const name = "smollm"
+	ctx := context.Background()
+	key := types.NamespacedName{Name: name, Namespace: "default"}
 
-		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: resourceNamespace,
+	newMD := func() *servingv1alpha1.ModelDeployment {
+		return &servingv1alpha1.ModelDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: servingv1alpha1.ModelDeploymentSpec{
+				Model: servingv1alpha1.ModelSource{
+					URL:  "https://example.com/model.gguf",
+					File: "model.gguf",
+				},
+			},
 		}
-		modeldeployment := &servingv1alpha1.ModelDeployment{}
+	}
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind ModelDeployment")
-			err := k8sClient.Get(ctx, typeNamespacedName, modeldeployment)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &servingv1alpha1.ModelDeployment{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: resourceNamespace,
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
-		})
+	reconcileOnce := func() {
+		r := &ModelDeploymentReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+	}
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &servingv1alpha1.ModelDeployment{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance ModelDeployment")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &ModelDeploymentReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
-		})
+	AfterEach(func() {
+		md := &servingv1alpha1.ModelDeployment{}
+		if err := k8sClient.Get(ctx, key, md); err == nil {
+			Expect(k8sClient.Delete(ctx, md)).To(Succeed())
+		}
+		// envtest 沒有 garbage collector：刪了 owner，子資源不會跟著消失，要手動清。
+		_ = k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}})
+		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}})
 	})
+
+	It("creates an owned Deployment and Service with defaults applied", func() {
+		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
+		reconcileOnce()
+
+		md := &servingv1alpha1.ModelDeployment{}
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		Expect(md.Spec.Runtime).To(Equal("llamacpp"))        // CRD default
+		Expect(md.Spec.Replicas).To(Equal(ptr.To[int32](1))) // CRD default
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
+		Expect(dep.Spec.Template.Spec.Containers[0].Image).To(Equal(defaultLlamaCppImage))
+		Expect(dep.Spec.Template.Spec.Containers[0].Args).To(ContainElement("/models/model.gguf"))
+
+		owner := metav1.GetControllerOf(dep)
+		Expect(owner).NotTo(BeNil())
+		Expect(owner.Kind).To(Equal("ModelDeployment"))
+		Expect(owner.UID).To(Equal(md.UID))
+
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, key, svc)).To(Succeed())
+		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(servingPort)))
+		Expect(metav1.GetControllerOf(svc).UID).To(Equal(md.UID))
+	})
+
+	It("writes status, and reports Progressing because envtest has no deployment controller", func() {
+		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
+		reconcileOnce()
+
+		md := &servingv1alpha1.ModelDeployment{}
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		Expect(md.Status.Endpoint).To(Equal("http://smollm.default.svc:8080"))
+		Expect(md.Status.ObservedGeneration).To(Equal(md.Generation))
+
+		c := meta.FindStatusCondition(md.Status.Conditions, conditionAvailable)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal("Progressing"))
+	})
+
+	It("propagates spec.replicas changes to the Deployment", func() {
+		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
+		reconcileOnce()
+
+		md := &servingv1alpha1.ModelDeployment{}
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		md.Spec.Replicas = ptr.To[int32](3)
+		Expect(k8sClient.Update(ctx, md)).To(Succeed())
+		reconcileOnce()
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		Expect(*dep.Spec.Replicas).To(Equal(int32(3)))
+	})
+
+	It("reports ScaledToZero when replicas is 0", func() {
+		md := newMD()
+		md.Spec.Replicas = ptr.To[int32](0)
+		Expect(k8sClient.Create(ctx, md)).To(Succeed())
+		reconcileOnce()
+
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		c := meta.FindStatusCondition(md.Status.Conditions, conditionAvailable)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Reason).To(Equal("ScaledToZero"))
+	})
+
+	DescribeTable("rejects invalid specs at the API server",
+		func(mutate func(*servingv1alpha1.ModelDeployment)) {
+			md := newMD()
+			mutate(md)
+			err := k8sClient.Create(ctx, md)
+			Expect(apierrors.IsInvalid(err)).To(BeTrue(), "got: %v", err)
+		},
+		Entry("path traversal in file", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Model.File = "../x.gguf" }),
+		Entry("non-gguf file", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Model.File = "model.bin" }),
+		Entry("plain http url", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Model.URL = "http://example.com/m.gguf" }),
+		Entry("unknown runtime", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Runtime = "vllm" }),
+		Entry("negative replicas", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Replicas = ptr.To[int32](-1) }),
+	)
 })
