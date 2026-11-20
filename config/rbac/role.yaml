@@ -7,6 +7,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumeclaims
   - services
   verbs:
   - create
@@ -15,6 +16,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - apps
@@ -28,6 +37,13 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - serving.llmlab.dev
   resources:

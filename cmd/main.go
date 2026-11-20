@@ -183,8 +183,9 @@ func main() {
 	}
 
 	if err := (&controller.ModelDeploymentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("modeldeployment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "modeldeployment")
 		os.Exit(1)

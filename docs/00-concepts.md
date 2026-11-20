@@ -124,7 +124,7 @@ metadata:
 
 - 使用者 `kubectl apply` 只能改 spec，改不到 status
 - controller 用 `r.Status().Update()` 只改 status
-- **只有 spec 變動會讓 `metadata.generation` +1**，status 變動不會
+- **只有 spec 變動會讓 `metadata.generation` +1**，status 變動不會（這是 CRD 的規則。內建資源可以有自己的規則：例如 Deployment 的 annotation 變動也會 +1，Phase 2 實驗 2 踩到過）
 
 **observedGeneration** 回答「controller 看過最新的 spec 了嗎」：
 
@@ -134,6 +134,12 @@ generation: 5, status.observedGeneration: 5   → status 反映的是最新的 s
 ```
 
 沒有這個欄位，使用者改完 spec 馬上看到 `Available=True`，無法分辨那是新版還是舊版的狀態。
+
+**generation 代表「期望狀態的第幾版」，而什麼算期望狀態由每種資源自己決定。** CRD 的規則是 spec 變才 +1；Deployment 則是 spec **或 annotations** 變都 +1。
+原因是 deployment controller 會把 Deployment 的 annotations 複製到目前那一版的 ReplicaSet —— Deployment 的版本歷史就存在這些 ReplicaSet 上，`kubectl rollout history` 顯示的 `CHANGE-CAUSE` 正是讀 ReplicaSet 上的 `kubernetes.io/change-cause`。
+annotation 一變，controller 就有事要做（同步到 ReplicaSet），所以 generation +1，`observedGeneration` 才能回答「同步完了沒」。
+注意兩種 annotation 的差別：`kubectl annotate deploy` 改的是 Deployment 自己的 `metadata.annotations`，只會讓 generation +1、不會動到 pod；`spec.template.metadata.annotations` 是 pod 模板的一部分，改它會觸發滾動更新（`kubectl rollout restart` 就是這樣做的）。
+**對寫 controller 的意義**：看到子資源的 generation 落後，不代表有人改了你關心的 spec；controller 會讀的欄位（包括 annotation）一變，就必須能觸發處理 —— 所以用 `GenerationChangedPredicate` 時，要確定你的 controller 不讀 CR 的 annotation。
 
 **Conditions** 是 k8s 的慣例（`metav1.Condition`）：
 

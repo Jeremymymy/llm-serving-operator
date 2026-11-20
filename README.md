@@ -51,9 +51,9 @@
 | 階段 | 文件 | 內容 | 狀態 |
 |---|---|---|---|
 | 概念 | [`docs/00-concepts.md`](docs/00-concepts.md) | operator 模式、reconcile、ownerReference、status、RBAC、與 KServe 的關係 | 📖 |
-| 環境 | [`docs/01-setup.md`](docs/01-setup.md) | Go、kubebuilder、kind、scaffold 專案 | ⬜ |
-| Phase 1 | [`docs/02-phase1-crd-and-reconcile.md`](docs/02-phase1-crd-and-reconcile.md) | CRD 型別與驗證、Deployment/Service reconcile、status、envtest、在 kind 上跑真模型 | ⬜ |
-| Phase 2 | （下一批） | controller 的可信度：減少無效寫入（SSA）、Events、錯誤狀態、PVC 模型快取、finalizer 的正確用途 | ⬜ |
+| 環境 | [`docs/01-setup.md`](docs/01-setup.md) | Go、kubebuilder、kind、scaffold 專案 | ✅ |
+| Phase 1 | [`docs/02-phase1-crd-and-reconcile.md`](docs/02-phase1-crd-and-reconcile.md) | CRD 型別與驗證、Deployment/Service reconcile、status、envtest、在 kind 上跑真模型 | ✅ |
+| Phase 2 | [`docs/03-phase2-trustworthy-controller.md`](docs/03-phase2-trustworthy-controller.md) | controller 的可信度：Server-Side Apply、status 樂觀鎖與 predicate、PVC 模型快取、Degraded condition 與 Events、finalizer 的效果與風險（實驗） | ✅ |
 | Phase 3 | （下一批） | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ⬜ |
 | Phase 4 | （下一批） | Admission：CEL 驗證 vs validating webhook（cert-manager） | ⬜ |
 | Phase 5 | （選做） | 接上 k8s-lab 的 pricer 模型與 HPA，用 MAE 驗收 | ⬜ |
@@ -64,7 +64,21 @@
 
 > 做到哪裡就填到哪裡。**沒量過的不要填。** 完整紀錄在 [`RESULTS.md`](RESULTS.md)。
 
-（尚未開始）
+環境：kind v0.33.0（Kubernetes v1.37.0）、kubebuilder v4.16.0、controller-runtime v0.25.0，MacBook Air（darwin/arm64，只用 CPU）。
+
+| 指標 | Phase 1 | Phase 2 |
+|---|---|---|
+| 沒有變更時，controller 對 Deployment 的寫入 | 每輪送一次 Update | 不寫入（Server-Side Apply） |
+| 手動 `kubectl scale` 時的 409 Conflict | 1 次 | 0 次 |
+| controller 停機重啟時，子資源的 409 | 3 次 | 0 次 |
+| Deployment 被誤刪後恢復 | 約 61 秒 | 約 6 秒（PVC 模型快取） |
+| 擴容 1→2 的 Ready 時間 | 約 61 秒 | 約 6 秒 |
+| 模型 URL 錯誤時的回報 | `Progressing` | `Degraded / ModelDownloadFailed` + Warning Event |
+| envtest 測試／`internal/controller` 覆蓋率 | 9 個／81.2% | 16 個／83.0% |
+
+- 錯誤的欄位（`file: ../x.gguf`、`url: http://...`）在 controller 沒有執行時，仍被 API server 當場拒絕（Phase 1 實驗 1）
+- 刪除 CR 時，子資源由 garbage collector 依 ownerReference 清掉，controller 沒有任何刪除邏輯（Phase 1 實驗 6）
+- Phase 2 過程中，靠新加的 Events 抓到 controller 自己的三個缺陷，各自先寫回歸測試再修正（`docs/03` 的插曲 1～3）
 
 ---
 
