@@ -362,7 +362,8 @@ kubectl -n $N logs -f deploy/llm-serving-operator-controller-manager | grep -E '
 1. 新 pod 先等 leader lease（舊 pod 被刪時沒有主動釋放 lease，要等它過期，實測約 30 秒）
 2. 拿到 lease 後，pod 的 informer 開始重複報錯：`Failed to watch ... "failed to list *v1.Pod: pods is forbidden: User \"system:serviceaccount:...\" cannot list resource \"pods\"`
 3. **這段期間 pod 一直是 `1/1 Running`**
-4. 拿到 lease 後**整整 2 分鐘**，manager 放棄並退出：`Failed to run manager {"error": "failed to wait for modeldeployment caches to sync kind source: *v1.Pod: timed out waiting for cache to be synced for kind source: *v1.Pod"}`
+4. 拿到 lease 後**整整 2 分鐘**，manager 放棄並退出：`Failed to run manager {"error": "failed to wait for modeldeployment caches to sync kind source: ...: timed out waiting for cache to be synced for kind source: ..."}`
+   - `kind source:` 後面寫的**不一定是 Pod**：寫文件時實測是 `*v1.Pod`，照做時是 `*v1alpha1.ModelDeployment`（前一行 `Could not wait for Cache to sync` 又寫 `*v1.PersistentVolumeClaim`）。每個 source 等的都是**整個 cache** 同步（controller-runtime `pkg/internal/source/kind.go` 的 `ks.Cache.WaitForCacheSync`），所以 Pod 起不來時全部一起 timeout，訊息寫的是最先回報的那個。**真正缺哪個權限，要看前面的 `forbidden`**
 5. container 重啟，`RESTARTS` 變成 1，然後重複 2～4
 
 **這個實驗要記住的三件事**：
@@ -386,6 +387,7 @@ kubectl -n $N rollout status deploy/llm-serving-operator-controller-manager
 ```bash
 docker tag $IMG llm-serving-operator:latest
 kind load docker-image llm-serving-operator:latest --name operator-lab
+kubectl -n $N delete deploy llm-serving-operator-controller-manager   # 先刪掉，理由見下方
 make deploy IMG=llm-serving-operator:latest
 kubectl -n $N get pods -w          # 等到 ImagePullBackOff，Ctrl-C
 kubectl -n $N get deploy llm-serving-operator-controller-manager \
@@ -399,7 +401,9 @@ Failed to pull image "llm-serving-operator:latest": ... failed to resolve refere
 pull access denied, repository does not exist or may require authorization
 ```
 
-image 明明已經在節點上（`docker exec operator-lab-control-plane crictl images | grep llm` 看得到），但 `Always` 讓 kubelet 一定要先問 registry。舊的 pod 因為 rolling update 的規則還在跑，所以 controller 沒有中斷 —— 這是 Deployment 的保護。
+image 明明已經在節點上（`docker exec operator-lab-control-plane crictl images | grep llm` 看得到），但 `Always` 讓 kubelet 一定要先問 registry。因為上面先刪了 Deployment，這段期間**沒有任何 controller 在跑**。
+
+> **為什麼要先刪 Deployment**：照做時第一次沒有刪，直接 `make deploy IMG=...:latest`，結果新 pod 正常 `Running`，`imagePullPolicy` 是 `IfNotPresent`。原因跟 3b 一模一樣，只是方向相反：Deployment 是 Part 4 用 `v0.0.1` 建立的，API server 當時補了 `IfNotPresent`；這次 apply 只換了 image，沒寫 `imagePullPolicy`，舊值就留著。所以只有**第一次建立**時就用 `:latest`，才會踩到這個陷阱。不刪也可以觀察：`get deploy -o jsonpath` 會看到 `llm-serving-operator:latest IfNotPresent` 這個組合，這本身就是 3b 要講的事。
 
 **3b：換回 v0.0.1，還是拉不到**
 
@@ -544,6 +548,8 @@ git status
 ```
 
 > **`config/manager/kustomization.yaml` 被改回 `controller:latest`**：plugin 內部會跑 `make build-installer`（用預設的 `IMG`）產生 `dist/install.yaml`，再從它轉成 chart。這不影響 chart，但之後忘了帶 `IMG=` 直接 `make deploy`，就會踩到實驗 3。下一次 `make deploy IMG=$IMG` 會再改回來。
+>
+> 照做時**沒有**被改回來：Part 4 的 `export IMG=llm-serving-operator:v0.0.1` 還在同一個 shell 裡，Makefile 的 `IMG ?=` 遇到環境變數就不用預設值，所以 kustomization、`dist/install.yaml`、`values.yaml` 的 image 都是 `v0.0.1`。`git status` 裡這個檔案仍然是 `M`，那是 Part 4 的 `make deploy` 改的。
 
 看一下產生了什麼：
 
@@ -563,11 +569,15 @@ cat dist/chart/values.yaml | grep -vE '^\s*#|^\s*$' | head -40
 
 ```bash
 helm lint dist/chart
-helm template test dist/chart --set manager.image.repository=llm-serving-operator --set manager.image.tag=v0.0.1 \
-  | grep -A3 'kind: ClusterRole' | head -20
+helm template llm-serving-operator dist/chart -n llm-serving-operator-system \
+  | grep -E '^kind:|^  name:' | paste - - | sort
 ```
 
-> `helm lint`／`helm template` 這兩步寫文件時沒有實測（寫文件的環境沒有 helm）。`lint` 預期是 `1 chart(s) linted, 0 chart(s) failed`；可能會有 `[INFO] Chart.yaml: icon is recommended` 這類資訊，不算失敗。
+- `helm lint` 檢查 chart 本身（必填欄位、模板語法、產生的 YAML）；`helm template` 把模板展開成 `helm install` 會送出的 YAML，但不送出。兩個都不碰叢集
+- release 名稱用 `make helm-deploy` 的 `llm-serving-operator`，資源名稱會**跟 kustomize 部署的完全一樣**（例如 `llm-serving-operator-manager-role`）—— 這就是實驗 6 要先 `make undeploy` 的原因。換成別的 release 名稱（例如 `test`），名稱會變成 `test-llm-serving-operator-...`
+- ClusterRole 只有 3 個（manager、metrics-auth、metrics-reader），kustomize 版有 6 個：admin/editor/viewer 因為 `rbac.helpers.enabled: false` 沒有產生
+
+> 照做時實測（helm v4.3.2）：`lint` 是 `1 chart(s) linted, 0 chart(s) failed`，另有一行 `[INFO] Chart.yaml: icon is recommended`，不算失敗。
 
 ### 6.3 實驗 6：用 Helm 部署，以及 `make undeploy` 與 `helm uninstall` 的差別
 
@@ -582,7 +592,8 @@ bin/kustomize build config/default | grep '^kind:' | sort | uniq -c   # 它會�
 ```bash
 kubectl get md,deploy,pvc
 date +%T; make undeploy
-kubectl get md,deploy,svc,pvc -l app.kubernetes.io/instance=smollm    # 預期全部消失
+kubectl get md                                                 # 預期 error：server 不認得 modeldeployments
+kubectl get deploy,svc,pvc -l app.kubernetes.io/instance=smollm  # 預期 No resources found
 ```
 
 **預期**：md 隨 CRD 被刪；Deployment、Service、PVC 由 GC 依 ownerReference 刪掉（Phase 1 實驗 6 的機制），**模型快取也沒了**。在正式環境這等於「升級 operator 的人不小心把所有客戶的推論服務都刪了」。
@@ -604,8 +615,11 @@ kubectl get md -w                    # 模型要重新下載，約 1 分鐘
 ```bash
 date +%T; make helm-uninstall
 kubectl get crd modeldeployments.serving.llmlab.dev      # 預期還在（keep）
-kubectl get md,deploy,svc,pvc -l app.kubernetes.io/instance=smollm
+kubectl get md smollm
+kubectl get deploy,svc,pvc -l app.kubernetes.io/instance=smollm
 ```
+
+> md 和子資源要分開查：一是 md 本身**沒有** `app.kubernetes.io/instance` 這個 label（label 是 controller 加在子資源上的），用 `-l` 永遠查不到 md；二是 CRD 不存在時，`kubectl get md,deploy,...` 會在 md 那裡直接報錯，後面的資源都不會印出來。
 
 **預期**：CRD、md、子資源**全部還在**，推論服務照常回應（02 Part 4.3 的 curl）。只是現在沒有 controller：刪掉 Deployment 不會被修復。
 

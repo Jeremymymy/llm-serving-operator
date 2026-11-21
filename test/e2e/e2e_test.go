@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -266,6 +267,49 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
 			}
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
+		})
+
+		It("should grant the manager only the permissions it needs", func() {
+			sa := fmt.Sprintf("system:serviceaccount:%s:%s", namespace, serviceAccountName)
+			cases := []struct {
+				check string
+				want  string
+			}{
+				{"create deployments.apps", "yes"}, // SSA 建立物件需要 create
+				{"patch deployments.apps", "yes"},  // SSA 是 PATCH
+				{"update deployments.apps", "no"},
+				{"delete deployments.apps", "no"}, // 刪除是 GC 的事
+				{"patch modeldeployments.serving.llmlab.dev --subresource=status", "yes"},
+				{"patch modeldeployments.serving.llmlab.dev", "no"}, // spec 是使用者的
+				{"get secrets", "no"},
+			}
+			for _, c := range cases {
+				args := append([]string{"auth", "can-i"}, strings.Fields(c.check)...)
+				args = append(args, "--as="+sa)
+				// 答案是 no 時 kubectl 以 exit code 1 結束，所以只看輸出、不看 err。
+				out, _ := utils.Run(exec.Command("kubectl", args...))
+				Expect(strings.TrimSpace(out)).To(Equal(c.want), "kubectl auth can-i %s", c.check)
+			}
+		})
+
+		It("should serve a ModelDeployment and garbage-collect its children on delete", func() {
+			By("applying the sample ModelDeployment")
+			_, err := utils.Run(exec.Command("kubectl", "apply", "-f", "config/samples/serving_v1alpha1_modeldeployment.yaml"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for Available=True (pulls the llama.cpp image and downloads the model)")
+			_, err = utils.Run(exec.Command("kubectl", "wait", "md/smollm", "--for=condition=Available", "--timeout=15m"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("deleting the ModelDeployment")
+			_, err = utils.Run(exec.Command("kubectl", "delete", "md", "smollm"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the garbage collector to delete the children")
+			for _, obj := range []string{"deployment/smollm", "service/smollm", "pvc/smollm-models"} {
+				_, err = utils.Run(exec.Command("kubectl", "wait", obj, "--for=delete", "--timeout=2m"))
+				Expect(err).NotTo(HaveOccurred(), "%s was not garbage-collected", obj)
+			}
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

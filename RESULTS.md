@@ -12,6 +12,7 @@
 | kubectl（client） | v1.37.2（Kustomize v5.8.1，Homebrew `/opt/homebrew/bin/kubectl`） |
 | kind node（`kubectl version` 的 Server Version） | v1.37.0（`kindest/node:v1.37.0`） |
 | 主機 | MacBook Air，darwin/arm64 |
+| helm | v4.3.2+g8346aaa（Phase 3 安裝；scaffold 的 `install-helm` 也是裝 Helm 4：`get-helm-4`） |
 
 > 一開始用的 kubectl 是 OrbStack 內建的 v1.33.9（`/usr/local/bin/kubectl` → `/Applications/OrbStack.app/Contents/MacOS/xbin/kubectl`），跑 `kubectl version` 時出現警告：
 > `WARNING: version difference between client (1.33) and server (1.37) exceeds the supported minor version skew of +/-1`
@@ -231,3 +232,153 @@ kube-controller-manager  Update  2026-11-20T06:11:09Z
   **本機照做的結果**（2026-11-20）：新測試在舊程式上失敗於 test.go:319（`got: <nil>`，15／16）；改好後 16／16、覆蓋率 83.0%、`make lint` 0 issues，跟 scratch 實測一致。
   **kind 上驗證**（16:54:22 重啟 controller，16:55:26 replicas 改成 2）：每個轉變**只有一筆** Event —— 16:55:26 `Warning Unavailable "Progressing: waiting for deployment controller to observe the latest spec"`、16:55:32 `Normal Available "2/2 replicas ready"`。log 裡 **1 次** `patch status` 409（`ERROR Reconciler error`，16:55:26），也就是被擋下的那一輪；重試後沒有再發 Event。`kubectl get md -w` 仍然有兩行 `1 False`：第二行是重試那一輪把 message 從 `waiting for...` 更新成 `1/2 replicas ready`，status 一樣是 False，不算轉變，所以沒有 Event。新 pod `npj59` 一樣印 `model already present`，Ready 1→2 約 6 秒（16:55:26 → 16:55:32），跟實驗 5 相同。插曲 3 修正有效
 - **實驗 7 文件裡的 `kubectl logs ... --previous` 拿不到 log**：`unable to retrieve container logs`。pod 停在 `Init:Error` 時，最近一次失敗的就是「目前」的 container，不加 `--previous` 就讀得到（文件已修正）
+
+## Phase 3：讓 controller 住進叢集
+
+### Part 2：controller image
+
+`make docker-build IMG=llm-serving-operator:v0.0.1`（2026-11-21，OrbStack）
+
+| 項目 | 結果 |
+|---|---|
+| build 時間 | 3.7 秒，**15 個步驟全部 `CACHED`**（含 `RUN go mod download` 和 `go build`）。這台機器之前已經 build 過同樣的內容，所以這次量不到第一次 build 和「只改一個 `.go` 檔」的時間 |
+| build context 傳輸量 | 第一次 72.85 kB、第二次 22.46 kB。BuildKit 只傳有變動的檔案，這是增量傳輸量，不是 context 的總大小，不拿來證明 `.dockerignore` 的效果 |
+| 編譯指令 | `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -a -o manager cmd/main.go`（`TARGETARCH` 自動填成 arm64） |
+| 架構／使用者 | `arm64 65532:65532`（`docker image inspect`） |
+| 改過 `.go` 檔之後重新 build（Part 4.2，Part 3 改了 marker 註解） | **20.0 秒**：`RUN go mod download` 是 `CACHED`，`COPY . .` 與 `go build` 重跑（`go build` 18.3 秒） |
+| 節點上的 image 大小（`crictl images`） | **31.7 MB**（`docker.io/library/llm-serving-operator:v0.0.1`） |
+
+### Part 3：RBAC 縮到最小
+
+marker 從 8 行改成 7 行（`services`、`persistentvolumeclaims` 合併成一行），`make manifests` 之後（2026-11-21）：
+
+| 項目 | 結果 |
+|---|---|
+| `role.yaml` diff | **只刪不增，共拿掉 10 個 verb**：`services`／`persistentvolumeclaims` 那條拿掉 `delete`、`update`；`deployments` 拿掉 `delete`、`update`；`modeldeployments` 拿掉 `create`、`delete`、`patch`、`update`；`modeldeployments/status` 拿掉 `get`、`update` |
+| 縮減後 | `modeldeployments` 剩 `get;list;watch`；`modeldeployments/status` 剩 `patch`；`modeldeployments/finalizers` 仍是 `update`；`deployments`、`services`、`persistentvolumeclaims` 剩 `create;get;list;patch;watch` |
+| rule 數 | 7 條（沒有變，只是每條的 verb 變少） |
+| `make test` | `internal/controller` `ok`（9.2 秒），覆蓋率 **83.0%**，跟 Phase 2 一樣。非 verbose 輸出沒有印出 spec 數 |
+| `make lint` | `0 issues.` |
+
+> envtest 的 client 是 admin 身份，所以拿掉這些權限測試也不會發現。權限到底夠不夠，要等 Part 4、5 在叢集內用 ServiceAccount 身份跑才知道。
+
+### Part 4：部署進 kind
+
+**部署前**：`operator-lab` 上原本沒有 `smollm`（Phase 2 結束後刪掉了），先用 `make run` 重建：06:29:23 建立，`kubectl get md -w` 在 AGE **21 秒**時變成 `1 / True`（PVC 也是新的，模型重新下載）。接著停掉 `make run`。
+
+`make deploy IMG=llm-serving-operator:v0.0.1`（2026-11-21）：
+
+| 項目 | 結果 |
+|---|---|
+| `make deploy` 建立的資源 | namespace、ServiceAccount、1 個 Role、6 個 ClusterRole（manager、metrics-auth、metrics-reader、modeldeployment admin/editor/viewer）、1 個 RoleBinding、2 個 ClusterRoleBinding、metrics Service、Deployment。CRD 是 `unchanged`（之前 `make install` 裝過） |
+| pod | `llm-serving-operator-controller-manager-69985d4cb5-7xpdz` `1/1 Running`，RESTARTS 0 |
+| 啟動 log | 06:33:51 同一秒內完成：`Starting manager` → `Attempting to acquire leader lease` → `Successfully acquired lease`（之前沒有人拿著 lease，所以不用等）→ 5 個 `Starting EventSource`（Pod、ModelDeployment、Deployment、Service、PVC）→ `Serving metrics server {"bindAddress": ":8443", "secure": true}` → `Starting workers {"worker count": 1}` → 第一輪 `Applied children` |
+| `Applied children` 輪數 | **1 輪**（`deploymentRV: 121243`、`serviceRV: 121157`、`pvcRV: 121206`） |
+| 接手後有沒有寫入 | **沒有**。三個 RV 在部署後仍是 `121243`／`121157`／`121206`；managedFields 裡 `llm-serving-operator  Apply` 的時間三個都是 **06:29:28Z**（`make run` 建立的那一秒），不是叢集內 controller 啟動的 06:33:51 |
+| md | `1 / True` |
+| Lease holder | `llm-serving-operator-controller-manager-69985d4cb5-7xpdz_6059462e-…`（就是這個 pod） |
+| log 裡的 `forbidden` | **0** |
+| log 裡的 `ERROR` | 0 |
+| `git status` | `make deploy` 改寫了 `config/manager/kustomization.yaml`（image 設成 `llm-serving-operator:v0.0.1`） |
+
+> 叢集內的 controller 和 `make run` 用同一個 field owner（`llm-serving-operator`），所以接手時算出來的 apply 內容和現有的一模一樣，API server 沒有寫入。
+
+### Part 6：Helm chart
+
+`kubebuilder edit --plugins=helm/v2-alpha`（2026-11-21，helm v4.3.2）：
+
+| 項目 | 結果 |
+|---|---|
+| `git status` 新增的變更 | `M Makefile`（+47 行：`install-helm`、`helm-deploy`、`helm-uninstall`、`helm-status`、`helm-history`、`helm-rollback`）、`M PROJECT`（`plugins: helm.kubebuilder.io/v2-alpha`，`manifests: dist/install.yaml`、`output: dist`）、`?? .github/workflows/test-chart.yml`、`?? dist/` |
+| `config/manager/kustomization.yaml` | **沒有被改回 `controller:latest`**，仍是 `llm-serving-operator:v0.0.1`（見「與預期不同」） |
+| `dist/` | `install.yaml`（image `llm-serving-operator:v0.0.1`）＋ `chart/` 底下 21 個檔案：`Chart.yaml`、`values.yaml`、`.helmignore`、`templates/` 下的 `crd/`、`manager/`、`metrics/`、`network-policy/`、`prometheus/`、`rbac/`（12 個）、`_helpers.tpl`、`NOTES.txt` |
+| `values.yaml` 重點 | `manager.image` = `llm-serving-operator` / `"v0.0.1"` / `pullPolicy: IfNotPresent`；`crd.keep: true`；`rbac.helpers.enabled: false`；`certManager`、`webhook`、`prometheus`、`networkPolicy` 都是 `enabled: false` |
+| chart 的 RBAC 與 `config/` 是否一致 | `templates/rbac/manager-role.yaml` 的 `rules:` 跟 `config/rbac/role.yaml` **逐字相同**（`diff` 無差異） |
+| CRD 的 keep | `templates/crd/` 的 CRD 帶 `{{- if .Values.crd.keep }} "helm.sh/resource-policy": keep` |
+| `helm lint dist/chart` | `1 chart(s) linted, 0 chart(s) failed`，只有 `[INFO] Chart.yaml: icon is recommended` |
+| `helm template llm-serving-operator dist/chart` | 13 個資源：CRD、ServiceAccount、Deployment、metrics Service、Role／RoleBinding（leader election）、**3 個 ClusterRole**（manager、metrics-auth、metrics-reader）、2 個 ClusterRoleBinding。名稱跟 kustomize 版完全相同（`llm-serving-operator-*`）。kustomize 版有 6 個 ClusterRole，少的是 `rbac.helpers.enabled: false` 關掉的 admin/editor/viewer。用 release 名稱 `test` 時名稱會變成 `test-llm-serving-operator-*` |
+
+### Part 7：e2e 測試（本機）
+
+`go vet -tags=e2e ./test/e2e/` 沒有輸出；`time make test-e2e`（2026-11-21 21:37～21:40，全新的 kind 叢集 `llm-serving-operator-test-e2e`）：
+
+| 項目 | 結果 |
+|---|---|
+| 結果 | `Ran 4 of 4 Specs in 169.479 seconds`，**`SUCCESS! -- 4 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`** |
+| BeforeSuite（build image、kind load、裝 cert-manager v1.21.1） | 47.8 秒（image build 2.6 秒，全快取） |
+| should run successfully | 3.2 秒 |
+| should ensure the metrics endpoint is serving metrics | 20.4 秒 |
+| should grant the manager only the permissions it needs | 0.2 秒（7 個 `auth can-i`） |
+| should serve a ModelDeployment and garbage-collect its children on delete | 84.8 秒：等 `Available=True` **74.7 秒**（21:38:29.3 → 21:39:43.9，叢集是新的，llama.cpp image 冷拉＋下載模型）；GC 刪掉 Deployment／Service／PVC **3.0 秒**；剩下約 7 秒是 `AfterAll` 的清理（undeploy、uninstall、刪 namespace），Ginkgo 把它算在最後一個 spec 裡 |
+| AfterSuite（移除 cert-manager） | 13.1 秒 |
+| 整個 `make test-e2e`（含建叢集、刪叢集） | **3 分 2.6 秒**（`real 3m2.585s`） |
+| 跑完後的 kubectl context | `current-context is not set`（e2e 叢集被刪，context 不會自動切回 `operator-lab`） |
+
+### 實驗
+
+| # | 實驗 | 指令重點 | 觀察到的結果 | 時間 |
+|---|---|---|---|---|
+| 1 | RBAC 矩陣 | `kubectl auth can-i <verb> <resource> --as=system:serviceaccount:llm-serving-operator-system:llm-serving-operator-controller-manager`，12 個組合 | **12 個全部跟預期一致**（原文在下方）。`create`／`patch deployments` yes，`update`／`delete` no；`get secrets` no；`patch modeldeployments` no、`patch .../status` yes、`update .../finalizers` yes；`create leases` 在自己的 namespace yes、在 `default` no（leader election 是 Role，不是 ClusterRole） | — |
+| 2 | 少給一個權限（拿掉 `pods`） | `kubectl patch clusterrole ... remove /rules/1`，16:12:45 `rollout restart`，`get pods -w`，grep log 的 `lease`／`forbidden`／`timed out`／`Failed to run` | 新 pod `qq6gs` 一直 `1/1 Running`，每隔約 2.5 分鐘 container 自己退出一次。拿到 lease 的同一秒開始報 `pods is forbidden: ... cannot list resource "pods" in API group "" at the cluster scope`，informer 以退避間隔重試（1、2、5、13、18、32、49 秒）。拿到 lease 後**剛好 2 分鐘**放棄：`Failed to run manager {"error": "failed to wait for modeldeployment caches to sync kind source: *v1alpha1.ModelDeployment: timed out waiting for cache to be synced ..."}`，`main.go` `os.Exit(1)` → `Error` → `CrashLoopBackOff`（約 10 秒）→ 重啟。第 3 個 container 在 08:17:52 就 `1/1`，比它拿到 lease（08:17:58）還早 → **Ready 跟 controller 有沒有在工作完全無關** | 每輪：等 lease 16～17 秒 + cache sync 等 2 分鐘 + 退避約 10 秒 |
+| 3 | `:latest` 的兩個陷阱 | (0) 不刪 Deployment 直接 `make deploy IMG=...:latest`；(a) 刪掉 Deployment 再 `make deploy IMG=...:latest`；(b) `make deploy IMG=...:v0.0.1`；(修) 刪掉重建 | (0) pod 正常 Running，Deployment 是 **`latest` + `IfNotPresent`**（見「與預期不同」）。(a) 新 pod 7 秒 `ErrImagePull`、21 秒 `ImagePullBackOff`，`imagePullPolicy: Always`；Events：`Failed to pull image "llm-serving-operator:latest": ... failed to resolve reference "docker.io/library/llm-serving-operator:latest": pull access denied, repository does not exist or may require authorization: server message: insufficient_scope: authorization failed`。節點上 `crictl images` 明明有 `latest` 和 `v0.0.1`（同一個 image ID `79eec113c18cf`，31.7 MB）。因為先刪了 Deployment，這段期間沒有 controller 在跑。(b) Deployment 變成 **`v0.0.1` + `Always`**，新 pod `56cv9` 2 秒 `ErrImagePull`、18 秒 `ImagePullBackOff`；舊 pod `9g4v8` 也還在 `ImagePullBackOff` → 兩個 pod 都起不來，controller 繼續停擺。(修) 刪掉 Deployment 重建 → `IfNotPresent`，rollout 成功；新 pod 09:35:14 拿到 lease、`Starting workers`，`forbidden` 0，md 仍是 `1 / True` | (a) 到 `ImagePullBackOff` 21 秒 |
+| 4 | leader election failover | scale 成 2 → 看 lease 與兩個 pod 的 log → 17:41:22 刪掉 leader `v88s8` → 每秒查 lease holder | 兩個 pod 都 `1/1 Running`，lease 只有一個 holder（`v88s8`，`leaseDurationSeconds: 15`）。待命的 `6ht7j` log 停在 `Attempting to acquire leader lease...`，沒有 `Starting workers`（但 health probe 和 metrics server 都已經啟動，所以它也是 Ready）。刪掉 leader 後 **16 秒**換人（17:41:22 → 17:41:38），接手的是**原本待命的 `6ht7j`**（lease `acquireTime` 09:41:37.9Z），不是 Deployment 新補的 pod。scale 回 1 時，Deployment 刪掉的是新補上的那個 pod，留下的正好是 leader `6ht7j`，所以沒有再換一次人。`leaseTransitions` 到這時是 10 | failover 16 秒 |
+| 5 | 用 metrics 取代 grep log | 建 `metrics-viewer` SA 綁 `metrics-reader`，`kubectl create token`，port-forward metrics Service，`curl -sk -H "Authorization: Bearer ..." https://localhost:8443/metrics` | port-forward 與 curl 都照文件描述運作，200 並回傳指標（原文在下方）。`reconcile_total{result="success"}` **1**，`error`／`requeue`／`requeue_after` 都是 0，`reconcile_errors_total` 0；`workqueue_depth` 0；**`process_resident_memory_bytes` 3.07e+07（約 29.3 MiB）**，`manager.yaml` 的 limit 是 128Mi，用了約 23%。success 只有 1：計數器是**每個 process 自己的**，這個 pod（`6ht7j`）09:41:37 才在實驗 4 接手成為 leader，之後只跑了接手那 1 輪；之前 `v88s8` 的計數隨 pod 一起消失。做完 `kill %1`，確認沒有殘留的 port-forward process，8443 也沒有人在 listen | — |
+| 6 | `make undeploy` vs `helm uninstall` | `kustomize build config/default \| grep ^kind:` → 21:01:58 `make undeploy` → `make helm-deploy` → apply 範例 CR → 21:06:56 `make helm-uninstall` → 查 CRD、子資源 → 再 `make helm-deploy` | **`make undeploy`**：會刪 9 種資源，含 `Namespace` 和 `CustomResourceDefinition`。刪完 `kubectl get md` 報 `the server could not find the requested resource`（CRD 沒了）。子資源也被 GC 刪掉：之後重建的 PVC 是新的 volume（`pvc-1e296ed4…` → `pvc-d64e7232…`），**模型快取沒了**。**`make helm-deploy`**：21:02:59 安裝，`STATUS: deployed`、`REVISION: 1`，11 秒內 controller `1/1`；CRD 由 Helm 重新建立（13:02:59Z）。重新 apply 範例 CR，**17 秒**回到 `1 / True`（重新下載模型）。**`make helm-uninstall`**：helm 印出 `These resources were kept due to the resource policy: [CustomResourceDefinition] modeldeployments.serving.llmlab.dev`；CRD 還在，md `smollm`（creationTimestamp 13:03:56Z）、Deployment `1/1`、Service、PVC（`pvc-d64e7232…`）**全部還在**。**再 `make helm-deploy`**（21:08:12）：`Release ... does not exist. Installing it now.`，順利安裝，**沒有** ownership 錯誤 —— 留下來的 CRD 仍帶 `app.kubernetes.io/managed-by: Helm` 與 `meta.helm.sh/release-name: llm-serving-operator`，新的 release 直接接手。md 仍是 `1 / True`，新 controller log `forbidden` 0 | undeploy 到 helm 裝好約 1 分鐘；md 重建到 Available 17 秒 |
+
+**實驗 1 輸出原文**：
+
+```
+create deployments.apps                                                  yes
+patch deployments.apps                                                   yes
+update deployments.apps                                                  no
+delete deployments.apps                                                  no
+list pods                                                                yes
+delete pods                                                              no
+get secrets                                                              no
+patch modeldeployments.serving.llmlab.dev                                no
+patch modeldeployments.serving.llmlab.dev --subresource=status           yes
+update modeldeployments.serving.llmlab.dev --subresource=finalizers      yes
+create leases.coordination.k8s.io -n llm-serving-operator-system         yes
+create leases.coordination.k8s.io -n default                             no
+```
+
+**實驗 5 指標原文**（2026-11-21，pod `6ht7j`）：
+
+```
+controller_runtime_reconcile_errors_total{controller="modeldeployment"} 0
+controller_runtime_reconcile_total{controller="modeldeployment",result="error"} 0
+controller_runtime_reconcile_total{controller="modeldeployment",result="requeue"} 0
+controller_runtime_reconcile_total{controller="modeldeployment",result="requeue_after"} 0
+controller_runtime_reconcile_total{controller="modeldeployment",result="success"} 1
+process_resident_memory_bytes 3.0707712e+07
+workqueue_depth{controller="modeldeployment",name="modeldeployment",priority="-100"} 0
+```
+
+> `workqueue_depth` 除了文件寫的 `name` 之外，還多了 `controller` 和 `priority="-100"` 兩個 label（文件的 grep 是用正規表示式比對，所以照樣抓得到）。記憶體這個數字是之後做 `cache.Options.ByObject`（只 cache 需要的 pod）時的比較基準：kind 上目前只有十幾個 pod。
+
+**實驗 2 時間軸**（log 是 UTC，08:xx = 本地 16:xx；第 1 個 container 的 log 已經拿不到，以下是第 2、3 個）：
+
+| 時間（UTC） | 事件 | 來源 |
+|---|---|---|
+| 08:12:45 | `rollout restart`，新 pod `qq6gs` 建立；約 10 秒後 `1/1`，舊 pod `7xpdz` 開始 `Terminating` | `date`、`get pods -w` |
+| 約 08:15:12 | 第 1 個 container 退出，RESTARTS 變成 1（由「age 4m18s 時 `1 (111s ago)`」推算） | `get pods -w` |
+| 08:15:13 | 第 2 個 container：`Attempting to acquire leader lease...` | `logs --previous` |
+| 08:15:29 | `Successfully acquired lease`（等了 16 秒）；同一秒第一次 `pods is forbidden` | `logs --previous` |
+| 08:15:30～08:16:40 | 重試 `Failed to watch`：:30、:32、:37、:50、16:08、16:40 | `logs --previous` |
+| 08:17:29 | 剛好 2 分鐘：`Could not wait for Cache to sync`（source 是 `*v1.PersistentVolumeClaim`）→ `Failed to run manager`（source 是 `*v1alpha1.ModelDeployment`） | `logs --previous` |
+| 約 08:17:30 | `0/1 Error`，接著 `CrashLoopBackOff` | `get pods -w`（age 4m45s、4m49s） |
+| 08:17:41 | 第 3 個 container 啟動，RESTARTS 2 | log、`get pods -w`（age 4m56s） |
+| 約 08:17:52 | `1/1 Running` | `get pods -w`（age 5m7s） |
+| 08:17:58 | `Successfully acquired lease`（等了 17 秒）；同一秒 `pods is forbidden` | log |
+
+- **「pod Ready 但 controller 沒在工作」的長度**：每一輪約 **2 分 16 秒**（等 lease 16～17 秒 + cache sync 等 2 分鐘），之後短暫 `Error`／`CrashLoopBackOff` 約 10 秒，然後再來一輪。只要權限沒補回來就一直重複
+- **還原**：`make deploy` + `rollout restart` 之後，新 pod `4zn9s` 在 08:31:59 拿到 lease，同一秒 `Starting workers`；ClusterRole 的 `pods` rule 回來了；log 裡 `forbidden` 為 0。Lease 的 `leaseTransitions` 到這時是 7（每換一次 holder +1）
+
+### 與預期不同
+
+- **實驗 2 的 timeout 錯誤訊息裡點名的不是 Pod**：文件預期 `timed out waiting for cache to be synced for kind source: *v1.Pod`；實際 `Could not wait for Cache to sync` 點名 `*v1.PersistentVolumeClaim`，`Failed to run manager` 點名 `*v1alpha1.ModelDeployment`。真正沒同步的只有 Pod（log 裡只有 Pod 的 `forbidden`）。原因（讀 controller-runtime v0.25.0 `pkg/internal/source/kind.go` 確認）：每個 source 在 `Start` 裡呼叫的是 `ks.Cache.WaitForCacheSync(ctx)`，等的是**整個 cache 的所有 informer**，不是只有自己那一種。所以 Pod 的 informer 起不來時，5 個 source 全部卡住，2 分鐘一到全部 timeout，訊息裡寫的是**最先回報的那個**，不一定是出問題的那個。**看到 timeout 訊息時，要回頭找 `forbidden` 才知道真正缺的是哪個權限**（文件已修正）
+- **實驗 3a 照文件的順序做，沒有出現 `ImagePullBackOff`**（2026-11-21 17:25）：`make deploy IMG=llm-serving-operator:latest` 之後，新 pod `lqlc4` 11 秒就 `1/1 Running`。Deployment 是 `llm-serving-operator:latest  IfNotPresent`。原因就是 3b 的機制，方向相反：Deployment 在 Part 4（06:33:50Z）以 `v0.0.1` 建立，API server 補了 `IfNotPresent`；`kubectl apply` 只換 image、沒寫 `imagePullPolicy`，舊值留著，不會因為 tag 變成 `latest` 就重算成 `Always`。要重現 3a，得先刪掉 Deployment 再用 `:latest` 建立（文件已修正）
+- **`kubebuilder edit --plugins=helm/v2-alpha` 沒有把 `config/manager/kustomization.yaml` 改回 `controller:latest`**：文件預期 plugin 用 Makefile 預設的 `IMG ?= controller:latest` 跑 `make build-installer`。但 Part 4 執行過 `export IMG=llm-serving-operator:v0.0.1`，Makefile 的 `?=` 只在變數沒有值時才生效，環境變數優先，所以 plugin 用的是 `v0.0.1`：kustomization、`dist/install.yaml`、`values.yaml` 的 image 都是 `llm-serving-operator:v0.0.1`。沒有 `export` 的話，才會出現文件描述的情況（文件已補充）
+- **文件 6.2 的 `helm template ... | grep -A3 'kind: ClusterRole'` 看不到 rule 內容**：`-A3` 只印到 `rules:` 那一行。RBAC 是否一致改用 `diff` 確認（見 Part 6 表格），文件的指令換成列出所有資源的種類與名稱
+- **實驗 6 文件裡的 `kubectl get md,deploy,svc,pvc -l app.kubernetes.io/instance=smollm` 不能用**：(1) CRD 被刪之後，kubectl 在 `md` 那裡直接報 `NotFound ... could not find the requested resource`，後面的 deploy/svc/pvc 都沒有印出來，所以 `make undeploy` 後看不到「子資源全部消失」；(2) md 本身沒有任何 label（`metadata.labels` 是空的），`app.kubernetes.io/instance` 是 controller 加在子資源上的，所以 `helm uninstall` 後這行也查不到 md。改成 md 與子資源分開查（文件已修正）。子資源確實被刪的證據改用「之後重建的 PVC 換了新的 volume」
+- **e2e 在全新叢集上冷拉 llama.cpp image，`Available=True` 只花了 74.7 秒**：文件預期冷啟動要多 5～6 分鐘（寫文件時本機 kind 拉這個 image 花了 6 分 7 秒，Phase 1 花了 7 分 57 秒）。實際整個 `make test-e2e` 3 分 2.6 秒，跟文件在「已經拉過 image」的叢集上量的 2 分 53 秒差不多。image 拉取時間主要看當下的網路，這次很快；今天在 `operator-lab` 重建 md 只花 17～21 秒，也是同樣的情況
