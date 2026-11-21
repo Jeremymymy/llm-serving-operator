@@ -54,7 +54,7 @@
 | 環境 | [`docs/01-setup.md`](docs/01-setup.md) | Go、kubebuilder、kind、scaffold 專案 | ✅ |
 | Phase 1 | [`docs/02-phase1-crd-and-reconcile.md`](docs/02-phase1-crd-and-reconcile.md) | CRD 型別與驗證、Deployment/Service reconcile、status、envtest、在 kind 上跑真模型 | ✅ |
 | Phase 2 | [`docs/03-phase2-trustworthy-controller.md`](docs/03-phase2-trustworthy-controller.md) | controller 的可信度：Server-Side Apply、status 樂觀鎖與 predicate、PVC 模型快取、Degraded condition 與 Events、finalizer 的效果與風險（實驗） | ✅ |
-| Phase 3 | （下一批） | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ⬜ |
+| Phase 3 | [`docs/04-phase3-in-cluster.md`](docs/04-phase3-in-cluster.md) | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ⬜ |
 | Phase 4 | （下一批） | Admission：CEL 驗證 vs validating webhook（cert-manager） | ⬜ |
 | Phase 5 | （選做） | 接上 k8s-lab 的 pricer 模型與 HPA，用 MAE 驗收 | ⬜ |
 
