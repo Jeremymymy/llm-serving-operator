@@ -815,16 +815,16 @@ git push
 
 ## 完成條件
 
-- [ ] `make docker-build` 成功，image 大小、架構、使用者已記錄
-- [ ] RBAC marker 已縮減，`make test` 16／16、`make lint` 0 issues
-- [ ] 叢集內的 controller 接手既有的 md，log 裡 `forbidden` 為 0
-- [ ] 實驗 1：`auth can-i` 矩陣跟預期一致
-- [ ] 實驗 2：記下「pod Ready 但 controller 沒在工作」的時間長度
-- [ ] 實驗 3：兩個 `:latest` 陷阱都重現過，並用刪除重建修好
-- [ ] 實驗 4：failover 秒數已記錄
-- [ ] 實驗 5：reconcile 次數與記憶體已從 `/metrics` 讀到
-- [ ] 實驗 6：`make undeploy` 刪光 md、`helm uninstall` 留下 md，兩者都親眼看過
-- [ ] `make test-e2e` 本機通過；GitHub Actions 四個 workflow 都是綠的
-- [ ] KNOWN-GAPS、README 已更新
+- [x] `make docker-build` 成功，image 大小、架構、使用者已記錄
+- [x] RBAC marker 已縮減，`make test` 16／16、`make lint` 0 issues
+- [x] 叢集內的 controller 接手既有的 md，log 裡 `forbidden` 為 0
+- [x] 實驗 1：`auth can-i` 矩陣跟預期一致
+- [x] 實驗 2：記下「pod Ready 但 controller 沒在工作」的時間長度
+- [x] 實驗 3：兩個 `:latest` 陷阱都重現過，並用刪除重建修好
+- [x] 實驗 4：failover 秒數已記錄
+- [x] 實驗 5：reconcile 次數與記憶體已從 `/metrics` 讀到
+- [x] 實驗 6：`make undeploy` 刪光 md、`helm uninstall` 留下 md，兩者都親眼看過
+- [x] `make test-e2e` 本機通過；GitHub Actions 四個 workflow 都是綠的
+- [x] KNOWN-GAPS、README 已更新
 
 > 下一階段（Phase 4）：Admission —— CEL 驗證規則 vs validating webhook。webhook 需要 TLS 憑證，會用到 cert-manager，也會用到這一階段建立的叢集內部署。

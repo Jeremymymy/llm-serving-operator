@@ -257,7 +257,7 @@ marker 從 8 行改成 7 行（`services`、`persistentvolumeclaims` 合併成�
 | `role.yaml` diff | **只刪不增，共拿掉 10 個 verb**：`services`／`persistentvolumeclaims` 那條拿掉 `delete`、`update`；`deployments` 拿掉 `delete`、`update`；`modeldeployments` 拿掉 `create`、`delete`、`patch`、`update`；`modeldeployments/status` 拿掉 `get`、`update` |
 | 縮減後 | `modeldeployments` 剩 `get;list;watch`；`modeldeployments/status` 剩 `patch`；`modeldeployments/finalizers` 仍是 `update`；`deployments`、`services`、`persistentvolumeclaims` 剩 `create;get;list;patch;watch` |
 | rule 數 | 7 條（沒有變，只是每條的 verb 變少） |
-| `make test` | `internal/controller` `ok`（9.2 秒），覆蓋率 **83.0%**，跟 Phase 2 一樣。非 verbose 輸出沒有印出 spec 數 |
+| `make test` | `internal/controller` `ok`（9.2 秒），覆蓋率 **83.0%**，跟 Phase 2 一樣。非 verbose 輸出沒有印出 spec 數；Phase 3 收尾時另跑 `go test ./internal/controller/ -v`：`Ran 16 of 16 Specs`，**`SUCCESS! -- 16 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`**，覆蓋率 83.0% |
 | `make lint` | `0 issues.` |
 
 > envtest 的 client 是 admin 身份，所以拿掉這些權限測試也不會發現。權限到底夠不夠，要等 Part 4、5 在叢集內用 ServiceAccount 身份跑才知道。
@@ -313,6 +313,26 @@ marker 從 8 行改成 7 行（`services`、`persistentvolumeclaims` 合併成�
 | AfterSuite（移除 cert-manager） | 13.1 秒 |
 | 整個 `make test-e2e`（含建叢集、刪叢集） | **3 分 2.6 秒**（`real 3m2.585s`） |
 | 跑完後的 kubectl context | `current-context is not set`（e2e 叢集被刪，context 不會自動切回 `operator-lab`） |
+
+### Part 7：GitHub Actions（commit `c0b6fa8`，2026-11-21，repo 當時是 private）
+
+| workflow | 結果 | 時間 |
+|---|---|---|
+| Lint | ✅ | 5 分 11 秒 |
+| Tests | ✅ | 4 分 32 秒 |
+| E2E Tests | ✅ | **9 分 0 秒** |
+| Test Chart | ✅ | 5 分 8 秒 |
+
+**E2E Tests 的細項**（`gh run view --log`）：
+
+| 項目 | CI（ubuntu runner，amd64） | 本機（M 系列 Mac） |
+|---|---|---|
+| `Running Test e2e` 這一步 | **8 分 25 秒**（13:48:43 → 13:57:08，含建 kind 叢集、`make manifests generate fmt vet`、刪叢集） | `make test-e2e` 共 3 分 2.6 秒 |
+| Ginkgo | `Ran 4 of 4 Specs in 274.721 seconds`，`SUCCESS! -- 4 Passed \| 0 Failed` | 169.5 秒，4 Passed |
+| BeforeSuite | **187.7 秒**（runner 上沒有 Docker build cache，`golang:1.26` 要下載、`go mod download` 與編譯都要從頭跑） | 47.8 秒（image build 全快取，2.6 秒） |
+| 等 `Available=True` | **29.9 秒**（13:56:11.9 → 13:56:41.8，冷拉 llama.cpp image＋下載模型） | 74.7 秒 |
+
+> 文件預期 CI 的 e2e 時間大部分花在等 llama.cpp image；實際上 runner 拉 image 和下載模型只用了 30 秒（GitHub 機房的網路比家裡快），**最慢的是 BeforeSuite 從零 build controller image（約 3 分鐘）**。
 
 ### 實驗
 
@@ -382,3 +402,4 @@ workqueue_depth{controller="modeldeployment",name="modeldeployment",priority="-1
 - **文件 6.2 的 `helm template ... | grep -A3 'kind: ClusterRole'` 看不到 rule 內容**：`-A3` 只印到 `rules:` 那一行。RBAC 是否一致改用 `diff` 確認（見 Part 6 表格），文件的指令換成列出所有資源的種類與名稱
 - **實驗 6 文件裡的 `kubectl get md,deploy,svc,pvc -l app.kubernetes.io/instance=smollm` 不能用**：(1) CRD 被刪之後，kubectl 在 `md` 那裡直接報 `NotFound ... could not find the requested resource`，後面的 deploy/svc/pvc 都沒有印出來，所以 `make undeploy` 後看不到「子資源全部消失」；(2) md 本身沒有任何 label（`metadata.labels` 是空的），`app.kubernetes.io/instance` 是 controller 加在子資源上的，所以 `helm uninstall` 後這行也查不到 md。改成 md 與子資源分開查（文件已修正）。子資源確實被刪的證據改用「之後重建的 PVC 換了新的 volume」
 - **e2e 在全新叢集上冷拉 llama.cpp image，`Available=True` 只花了 74.7 秒**：文件預期冷啟動要多 5～6 分鐘（寫文件時本機 kind 拉這個 image 花了 6 分 7 秒，Phase 1 花了 7 分 57 秒）。實際整個 `make test-e2e` 3 分 2.6 秒，跟文件在「已經拉過 image」的叢集上量的 2 分 53 秒差不多。image 拉取時間主要看當下的網路，這次很快；今天在 `operator-lab` 重建 md 只花 17～21 秒，也是同樣的情況
+- **CI 的 e2e 時間大部分不是花在 llama.cpp image**：文件 7.6 預期 `Running Test e2e` 的大部分時間在等 llama.cpp image；實際上等 `Available=True` 只有 29.9 秒，BeforeSuite（從零 build controller image、裝 cert-manager）花了 187.7 秒。runner 沒有 Docker layer cache，每次都要下載 `golang:1.26` 並重新編譯

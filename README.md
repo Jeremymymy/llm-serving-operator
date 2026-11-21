@@ -54,7 +54,7 @@
 | 環境 | [`docs/01-setup.md`](docs/01-setup.md) | Go、kubebuilder、kind、scaffold 專案 | ✅ |
 | Phase 1 | [`docs/02-phase1-crd-and-reconcile.md`](docs/02-phase1-crd-and-reconcile.md) | CRD 型別與驗證、Deployment/Service reconcile、status、envtest、在 kind 上跑真模型 | ✅ |
 | Phase 2 | [`docs/03-phase2-trustworthy-controller.md`](docs/03-phase2-trustworthy-controller.md) | controller 的可信度：Server-Side Apply、status 樂觀鎖與 predicate、PVC 模型快取、Degraded condition 與 Events、finalizer 的效果與風險（實驗） | ✅ |
-| Phase 3 | [`docs/04-phase3-in-cluster.md`](docs/04-phase3-in-cluster.md) | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ⬜ |
+| Phase 3 | [`docs/04-phase3-in-cluster.md`](docs/04-phase3-in-cluster.md) | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ✅ |
 | Phase 4 | （下一批） | Admission：CEL 驗證 vs validating webhook（cert-manager） | ⬜ |
 | Phase 5 | （選做） | 接上 k8s-lab 的 pricer 模型與 HPA，用 MAE 驗收 | ⬜ |
 
@@ -79,6 +79,18 @@
 - 錯誤的欄位（`file: ../x.gguf`、`url: http://...`）在 controller 沒有執行時，仍被 API server 當場拒絕（Phase 1 實驗 1）
 - 刪除 CR 時，子資源由 garbage collector 依 ownerReference 清掉，controller 沒有任何刪除邏輯（Phase 1 實驗 6）
 - Phase 2 過程中，靠新加的 Events 抓到 controller 自己的三個缺陷，各自先寫回歸測試再修正（`docs/03` 的插曲 1～3）
+- `make undeploy` 會刪掉 CRD，連帶刪光所有 md 與模型快取；Helm chart 的 CRD 帶 `resource-policy: keep`，`helm uninstall` 後 md 與子資源都還在、Deployment 仍是 1/1（Phase 3 實驗 6）
+
+**Phase 3：controller 住進叢集**
+
+| 指標 | 結果 |
+|---|---|
+| controller image（distroless、非 root、arm64） | 31.7 MB（節點上 `crictl images`） |
+| RBAC | 7 條 rule，縮減時拿掉 10 個 verb（spec 不可寫、沒有 `update`／`delete`、讀不到 Secret），`kubectl auth can-i` 12 項與預期一致，叢集內 log 的 `forbidden` 為 0 |
+| leader failover（刪掉 leader pod 到新 leader 接手） | 16 秒 |
+| 少給 `pods` 權限時，pod 顯示 Ready 但 controller 沒在工作 | 每輪約 2 分 16 秒，之後才 CrashLoopBackOff |
+| controller 記憶體（`/metrics`） | 約 29 MiB（limit 128Mi） |
+| e2e（4 個測試，含真的拉 llama.cpp、等 Available、驗證 GC） | 本機 3 分 3 秒；GitHub Actions 9 分 0 秒 |
 
 ---
 
