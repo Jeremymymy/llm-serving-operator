@@ -995,15 +995,15 @@ git push
 
 ## 完成條件
 
-- [ ] 規則上線前建好違規的 `greedy`
-- [ ] CEL 規則與 3 個 envtest 測試，`make test` 通過
-- [ ] 實驗 1：親眼看到 md 搶走 Service、刪 md 時 Service 被 GC
-- [ ] webhook 與 8 個測試，`make test`、`make lint` 通過
-- [ ] cert-manager 裝好，`make helm-deploy` 升級成功
-- [ ] 實驗 2：ratcheting 的四種修改結果都看過
-- [ ] 實驗 3：webhook 擋下撞名；同時違規時只看到 CEL 的錯誤
-- [ ] 實驗 4：operator 停機時 CREATE 得到 `InternalError`
-- [ ] GitHub Actions 四個 workflow 都是綠的（E2E Tests 7 個通過）
-- [ ] KNOWN-GAPS、README 已更新
+- [x] 規則上線前建好違規的 `greedy`
+- [x] CEL 規則與 3 個 envtest 測試，`make test` 通過
+- [x] 實驗 1：親眼看到 md 搶走 Service、刪 md 時 Service 被 GC
+- [x] webhook 與 8 個測試，`make test`、`make lint` 通過
+- [x] cert-manager 裝好，`make helm-deploy` 升級成功
+- [x] 實驗 2：ratcheting 的四種修改結果都看過
+- [x] 實驗 3：webhook 擋下撞名；同時違規時只看到 CEL 的錯誤
+- [x] 實驗 4：operator 停機時 CREATE 得到 `InternalError`
+- [x] GitHub Actions 四個 workflow 都是綠的（E2E Tests 7 個通過）
+- [x] KNOWN-GAPS、README 已更新
 
 > 下一階段（Phase 5，選做）：讓 md 支援 LoRA adapter，接上 `llm-inference-k8s-lab` 的 pricer 模型，用 MAE 驗收（不做 HPA）。

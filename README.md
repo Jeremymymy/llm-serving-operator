@@ -55,7 +55,7 @@
 | Phase 1 | [`docs/02-phase1-crd-and-reconcile.md`](docs/02-phase1-crd-and-reconcile.md) | CRD 型別與驗證、Deployment/Service reconcile、status、envtest、在 kind 上跑真模型 | ✅ |
 | Phase 2 | [`docs/03-phase2-trustworthy-controller.md`](docs/03-phase2-trustworthy-controller.md) | controller 的可信度：Server-Side Apply、status 樂觀鎖與 predicate、PVC 模型快取、Degraded condition 與 Events、finalizer 的效果與風險（實驗） | ✅ |
 | Phase 3 | [`docs/04-phase3-in-cluster.md`](docs/04-phase3-in-cluster.md) | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ✅ |
-| Phase 4 | [`docs/05-phase4-admission.md`](docs/05-phase4-admission.md) | Admission：CEL 驗證 vs validating webhook（cert-manager）、validation ratcheting、webhook 停機與 HA 的行為 | ⬜ |
+| Phase 4 | [`docs/05-phase4-admission.md`](docs/05-phase4-admission.md) | Admission：CEL 驗證 vs validating webhook（cert-manager）、validation ratcheting、webhook 停機與 HA 的行為 | ✅ |
 | Phase 5 | （選做） | 接上 k8s-lab 的 pricer 模型（LoRA adapter），用 MAE 驗收（不做 HPA） | ⬜ |
 
 ---
@@ -91,6 +91,21 @@
 | 少給 `pods` 權限時，pod 顯示 Ready 但 controller 沒在工作 | 每輪約 2 分 16 秒，之後才 CrashLoopBackOff |
 | controller 記憶體（`/metrics`） | 約 29 MiB（limit 128Mi） |
 | e2e（4 個測試，含真的拉 llama.cpp、等 Available、驗證 GC） | 本機 3 分 3 秒；GitHub Actions 9 分 0 秒 |
+
+**Phase 4：Admission，CEL 與 validating webhook**
+
+| 指標 | 結果 |
+|---|---|
+| 沒有規則時，`requests.memory: 2Gi`／`limits.memory: 1Gi` 的 md | `kubectl apply` 成功，status 空白，錯誤只在 Event |
+| 加上 CEL 規則後 | `kubectl apply` 當下被拒；operator 停機時一樣有效 |
+| 規則上線前就存在的違規物件（ratcheting） | 改 metadata、改不相關欄位：成功＋Warning；改 resources 仍違規：被拒 |
+| 撞名的 md（沒有 webhook 時） | 搶走別人的 Service（selector 換掉、加上 ownerReference），沒有 Warning；刪 md 時 Service 被 GC 刪掉 |
+| 撞名的 md（有 webhook 時） | `kubectl apply` 當下 `Forbidden`，Service 不變 |
+| 同時違反 CEL 和 webhook | 只看到 CEL 的錯誤（schema 驗證先於 validating admission） |
+| operator 停機時建立 md | `InternalError`（connection refused），`failurePolicy: Fail` 的代價 |
+| webhook 延遲（讀 informer cache） | 平均約 10.7 毫秒（寫文件時 20 個請求實測） |
+| envtest 測試／覆蓋率 | `internal/controller` 19 個／83.0%；`internal/webhook` 8 個／80.0% |
+| e2e（7 個測試，含撞名、CA 注入） | GitHub Actions 4 分 33 秒 |
 
 ---
 

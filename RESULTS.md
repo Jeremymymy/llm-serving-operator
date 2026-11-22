@@ -403,3 +403,138 @@ workqueue_depth{controller="modeldeployment",name="modeldeployment",priority="-1
 - **實驗 6 文件裡的 `kubectl get md,deploy,svc,pvc -l app.kubernetes.io/instance=smollm` 不能用**：(1) CRD 被刪之後，kubectl 在 `md` 那裡直接報 `NotFound ... could not find the requested resource`，後面的 deploy/svc/pvc 都沒有印出來，所以 `make undeploy` 後看不到「子資源全部消失」；(2) md 本身沒有任何 label（`metadata.labels` 是空的），`app.kubernetes.io/instance` 是 controller 加在子資源上的，所以 `helm uninstall` 後這行也查不到 md。改成 md 與子資源分開查（文件已修正）。子資源確實被刪的證據改用「之後重建的 PVC 換了新的 volume」
 - **e2e 在全新叢集上冷拉 llama.cpp image，`Available=True` 只花了 74.7 秒**：文件預期冷啟動要多 5～6 分鐘（寫文件時本機 kind 拉這個 image 花了 6 分 7 秒，Phase 1 花了 7 分 57 秒）。實際整個 `make test-e2e` 3 分 2.6 秒，跟文件在「已經拉過 image」的叢集上量的 2 分 53 秒差不多。image 拉取時間主要看當下的網路，這次很快；今天在 `operator-lab` 重建 md 只花 17～21 秒，也是同樣的情況
 - **CI 的 e2e 時間大部分不是花在 llama.cpp image**：文件 7.6 預期 `Running Test e2e` 的大部分時間在等 llama.cpp image；實際上等 `Available=True` 只有 29.9 秒，BeforeSuite（從零 build controller image、裝 cert-manager）花了 187.7 秒。runner 沒有 Docker layer cache，每次都要下載 `golang:1.26` 並重新編譯
+
+## Phase 4：Admission，CEL vs validating webhook
+
+### Part 2：CEL，requests 不能大於 limits
+
+**2.0 規則上線前建立違規的 `greedy`**（2026-11-22，`operator-lab`，叢集上仍是 Phase 3 的 CRD 與 controller）：
+
+| 項目 | 結果 |
+|---|---|
+| `kubectl apply`（`requests.memory: 2Gi`、`limits.memory: 1Gi`、`replicas: 0`） | `modeldeployment.serving.llmlab.dev/greedy created`，沒有警告 |
+| `kubectl get md`（AGE 6s） | `greedy  llamacpp`，`READY`、`AVAILABLE` 都是空白 |
+
+> 留給實驗 2（ratcheting）用。
+
+**2.3 `make manifests`**：`config/crd/bases/serving.llmlab.dev_modeldeployments.yaml` 只多了 6 行，`spec.resources` 底下一條 `x-kubernetes-validations`（一條 `rule`、一條 `message`），跟文件預期一致。
+
+**2.4 envtest**（加 2 個 `Entry`：memory 2Gi > 1Gi、cpu `2` > `1500m`；1 個 `It`：`1024Mi` == `1Gi` 應該接受）：
+
+| 項目 | 結果 |
+|---|---|
+| `make test` | `internal/controller` `ok`（9.5 秒），覆蓋率 **83.0%**（跟 Phase 3 一樣，CEL 不是 Go 程式碼） |
+| `go test ./internal/controller/ -v` | `Ran 19 of 19 Specs in 8.414 seconds`，**`SUCCESS! -- 19 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`**（16 + 3） |
+
+### Part 3：Validating webhook
+
+**實驗 1：md 搶走別人的 Service**（2026-11-22，叢集上仍是 Phase 3 的 controller，沒有 webhook）：
+
+| 時間點 | Service `chat` 的 selector | ports | ownerReferences |
+|---|---|---|---|
+| `kubectl create service clusterip chat --tcp=80:8000` 之後 | `{"app":"chat"}` | `80-8000`（80→8000） | 無 |
+| 建立同名 md 之後 | md 的三個 label：`app.kubernetes.io/instance: chat`、`managed-by: llm-serving-operator`、`name: model-server` | `80-8000` **加上** `http`（8080→`http`），SSA 合併成兩個 | `ModelDeployment/chat`，`controller: true`、`blockOwnerDeletion: true` |
+
+- Events：`sleep 6` 後 `No events found`；再查一次只有 `Normal  Available  1/1 replicas ready`（14s ago）。**沒有任何 Warning**，md 自己回報一切正常
+- `kubectl delete md chat` → `sleep 3` → `kubectl get svc chat`：**`Error from server (NotFound): services "chat" not found`**。GC 依 ownerReference 把原本不屬於 md 的 Service 一起刪了
+
+**3.2 `kubebuilder create webhook --programmatic-validation`**（kubebuilder v4.16.0）：
+
+| 項目 | 結果 |
+|---|---|
+| 新修改的檔案 | `PROJECT`（+3）、`cmd/main.go`（+8）、`config/default/kustomization.yaml`、`config/network-policy/kustomization.yaml`（+1）、`test/e2e/e2e_test.go`（+49），跟文件列的 5 個一致（其他 `M` 是 Part 2 與文件本身的變更） |
+| 新增 | `config/certmanager/`（issuer、certificate-webhook、certificate-metrics）、`config/default/manager_webhook_patch.yaml`、`config/network-policy/allow-webhook-traffic.yaml`、`config/webhook/`（service）、`internal/webhook/v1alpha1/`（webhook、test、suite_test） |
+| `config/default/kustomization.yaml` 自動取消註解 | `../webhook`、`../certmanager`、`manager_webhook_patch.yaml` 的 patch，以及把 webhook Service 的名稱／namespace 串進 Certificate `dnsNames` 的 `replacements` |
+
+**3.3～3.5 webhook 實作與測試**：
+
+| 項目 | 結果 |
+|---|---|
+| `config/webhook/manifests.yaml` | `operations` 只有 `CREATE`（marker `verbs=create`），`failurePolicy: Fail`、`sideEffects: None` |
+| `make test` | `internal/controller` `ok`（9.2 秒）83.0%；`internal/webhook/v1alpha1` `ok`（6.4 秒）覆蓋率 **80.0%** |
+| `go test ./internal/webhook/... -v` | `Ran 8 of 8 Specs in 5.490 seconds`，**`SUCCESS! -- 8 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`** |
+| `make lint` | `0 issues.`（第一次跑時重新下載並建置 golangci-lint v2.13.1） |
+
+### Part 4：cert-manager 與部署
+
+| 項目 | 結果 |
+|---|---|
+| cert-manager v1.21.1 | `kubectl apply` 後三個 deployment `condition met`；dry-run Issuer 探針迴圈結束，印出 `cert-manager webhook is ready`（輸出導到 `/dev/null`，看不出重試了幾次） |
+| `make docker-build IMG=llm-serving-operator:v0.0.2` | 20.3 秒：`go mod download` `CACHED`，`go build` 重跑 18.5 秒；`kind load` 成功 |
+| `kubebuilder edit --plugins=helm/v2-alpha --force` 新的變更 | `M .github/workflows/test-chart.yml`、`M config/manager/kustomization.yaml`（**文件沒列**，見「與預期不同」）、`M dist/chart/templates/crd/...`、`M dist/chart/templates/manager/manager.yaml`、`M dist/chart/values.yaml`、`M dist/install.yaml`、`?? dist/chart/templates/cert-manager/`、`?? dist/chart/templates/network-policy/allow-webhook-traffic.yaml`、`?? dist/chart/templates/webhook/` |
+| `values.yaml` diff | 只有 tag `v0.0.1` → `v0.0.2`、`certManager.enabled` 與 `webhook.enabled` 由 `false` → `true` |
+| `helm lint dist/chart` | `1 chart(s) linted, 0 chart(s) failed`（只有 `icon is recommended` 的 INFO） |
+| `make helm-deploy IMG=$IMG` | `Release "llm-serving-operator" has been upgraded`、`REVISION: 2`，16:44:07 → 16:44:19，**約 12 秒** |
+| 升級後 | 新 pod `8fb74f647-6bvft` `1/1 Running`（12s），舊 pod 正在退出（`Completed`）；兩張 Certificate `metrics-certs`、`serving-cert` 都是 `READY True` |
+| CA 注入 | `llm-serving-operator-validating-webhook-configuration` 的 `caBundle` 已有值（`kubectl get validatingwebhookconfiguration`） |
+| md | 只有 `greedy`（status 仍是空的）；`operator-lab` 上目前沒有 `smollm` |
+
+### Part 5：實驗
+
+**實驗 2：ratcheting**（對規則上線前建立的 `greedy` 做四種修改，kind v1.37）：
+
+| 修改 | 結果 |
+|---|---|
+| 只改 metadata（`kubectl annotate`） | **成功**，附 `Warning: spec.resources: Invalid value: resources.requests must not exceed resources.limits (cpu, memory)` |
+| 改不相關的欄位（`spec.image`） | **成功**，附同一個 Warning |
+| 改 resources，但仍違規（limits 改 `1536Mi`） | **被拒**：`The ModelDeployment "greedy" is invalid: spec.resources: Invalid value: ...` |
+| 改成合規（limits 改 `2Gi`） | **成功**，沒有 Warning |
+
+跟文件預期逐字一致。做完 `kubectl delete md greedy`。
+
+**實驗 3：webhook 擋下撞名，以及誰先執行**（先 `kubectl create service clusterip chat --tcp=80:8000`）：
+
+| 送出 | 結果 |
+|---|---|
+| md `chat`（只撞名） | `Error from server (Forbidden): ... admission webhook "vmodeldeployment-v1alpha1.kb.io" denied the request: Service "chat" already exists in namespace "default" and is not managed by ModelDeployment "chat"; choose another name` |
+| md `chat`（撞名，而且 requests 2Gi > limits 1Gi） | **只有 CEL 的錯誤**：`The ModelDeployment "chat" is invalid: spec.resources: Invalid value: resources.requests must not exceed resources.limits (cpu, memory)`，沒有 webhook 的訊息 |
+| Service `chat` 的 selector | 仍是 `{"app":"chat"}`，沒有被搶走（對照實驗 1） |
+
+- 這是部署後第一個打到 webhook 的請求，`Forbidden` 本身就證明 TLS、CA 注入、Service 路由都接通了
+
+**實驗 4：operator 停機時建立 md**（scale 成 0，等 pod `8fb74f647-6bvft` 刪除後送出）：
+
+```
+Error from server (InternalError): error when creating "STDIN": Internal error occurred: failed calling webhook "vmodeldeployment-v1alpha1.kb.io":
+failed to call webhook: Post "https://llm-serving-operator-webhook-service.llm-serving-operator-system.svc:443/validate-serving-llmlab-dev-v1alpha1-modeldeployment?timeout=10s":
+dial tcp 10.96.202.56:443: connect: connection refused
+```
+
+- 錯誤是 **`InternalError`**，不是 `Forbidden`：`failurePolicy: Fail` 下，使用者看到的是「系統壞了」
+- 沒有量回應時間（沒加 `time`）；從 `connection refused` 看是 Service 沒有 endpoint、直接被拒，不是等 10 秒逾時
+- scale 回 1 後 `rollout status` 顯示 `successfully rolled out`
+
+### Part 6：e2e 與 GitHub Actions（commit `ef6405f`，2026-11-22）
+
+本機：`go vet -tags=e2e ./test/...` 通過、`make lint` `0 issues.`；照文件沒有在本機跑 `make test-e2e`。
+
+| workflow | 結果 | 時間 | Phase 3（`c0b6fa8`） |
+|---|---|---|---|
+| Lint | ✅ | 2 分 0 秒 | 5 分 11 秒 |
+| Tests | ✅ | 50 秒 | 4 分 32 秒 |
+| E2E Tests | ✅ | **4 分 33 秒** | 9 分 0 秒 |
+| Test Chart | ✅ | 3 分 20 秒 | 5 分 8 秒 |
+
+**E2E Tests 的細項**（`gh run view --log`）：
+
+| 項目 | 結果 |
+|---|---|
+| `Running Test e2e` 這一步 | 4 分 7 秒（09:51:39 → 09:55:46） |
+| Ginkgo | `Ran 7 of 7 Specs in 215.433 seconds`，**`SUCCESS! -- 7 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`** |
+| BeforeSuite（build image、kind load、裝 cert-manager、探針） | 138.7 秒 |
+| should run successfully | 16.9 秒 |
+| should ensure the metrics endpoint is serving metrics | 19.1 秒 |
+| should grant the manager only the permissions it needs | 0.5 秒 |
+| should serve a ModelDeployment and garbage-collect its children on delete | 19.0 秒 |
+| should provisioned cert-manager | 0.07 秒 |
+| should have CA injection for validating webhooks | 0.07 秒 |
+| should reject a ModelDeployment whose name is taken by another Service | 8.7 秒（含 `AfterAll` 清理） |
+
+**Test Chart 的細項**：新增的 `Install cert-manager via Helm (wait for readiness)` 15 秒、`Deploy manager via Helm` 12 秒。Helm 裝的是 **cert-manager v1.21.3**（log：`cert-manager v1.21.3 has been deployed successfully!`），e2e 固定 v1.21.1 —— 「沒有釘版本」已經造成兩個 workflow 用不同版本。
+
+> 四個 workflow 都比 Phase 3 快很多，E2E 從 9 分減半。這次沒有查原因（runner、cache 或網路），只記錄數字，不拿來下結論。
+
+### 與預期不同（Phase 4）
+
+- **實驗 1 的 Events 不是一直空的**：文件只寫 `No events found`；`sleep 6` 時確實是空的，但再查一次多了 `Normal  Available  1/1 replicas ready`。md 不只沒報錯，還回報成功（文件已補充）
+- **`kubebuilder edit --plugins=helm/v2-alpha --force` 也改了 `config/manager/kustomization.yaml`**：文件 4.3 的預期清單沒有列。Phase 3 commit 時這個檔案只有 `resources: [manager.yaml]`，這次 plugin 內部跑 `make build-installer`，`kustomize edit set image` 加上了 `newTag: v0.0.2`。跟 Phase 3 一樣，commit 前還原（文件已補充）
