@@ -1,0 +1,25 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-serving-llmlab-dev-v1alpha1-modeldeployment
+  failurePolicy: Fail
+  name: vmodeldeployment-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - serving.llmlab.dev
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    resources:
+    - modeldeployments
+  sideEffects: None

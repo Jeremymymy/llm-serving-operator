@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -369,7 +370,28 @@ var _ = Describe("ModelDeployment Controller", func() {
 		Entry("plain http url", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Model.URL = "http://example.com/m.gguf" }),
 		Entry("unknown runtime", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Runtime = "vllm" }),
 		Entry("negative replicas", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Replicas = ptr.To[int32](-1) }),
+		Entry("memory request above limit", func(md *servingv1alpha1.ModelDeployment) {
+			md.Spec.Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+			}
+		}),
+		Entry("cpu request above limit, in different units", func(md *servingv1alpha1.ModelDeployment) {
+			md.Spec.Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m")},
+			}
+		}),
 	)
+
+	It("accepts a request equal to its limit even when the units differ", func() {
+		md := newMD()
+		md.Spec.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1024Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		}
+		Expect(k8sClient.Create(ctx, md)).To(Succeed())
+	})
 })
 
 // staleReader 模擬 informer cache 落後：Get ModelDeployment 時回傳一份舊的快照，其他照常。

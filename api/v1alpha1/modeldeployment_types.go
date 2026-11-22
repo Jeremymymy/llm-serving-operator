@@ -59,6 +59,7 @@ type ModelDeploymentSpec struct {
 	Image string `json:"image,omitempty"`
 
 	// Resources 覆蓋推論容器預設的 requests/limits。
+	// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !has(self.limits) || ['cpu', 'memory'].all(r, !(r in self.requests) || !(r in self.limits) || quantity(string(self.requests[r])).compareTo(quantity(string(self.limits[r]))) <= 0)",message="resources.requests must not exceed resources.limits (cpu, memory)"
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }

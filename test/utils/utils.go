@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
@@ -96,8 +97,28 @@ func InstallCertManager() error {
 		"--timeout", "5m",
 	)
 
-	_, err := Run(cmd)
-	return err
+	if _, err := Run(cmd); err != nil {
+		return err
+	}
+
+	// webhook pod Available，不代表 cainjector 已經把 CA 填進 cert-manager 自己的 webhook 設定。
+	// 這段空窗內建立 Issuer／Certificate 會得到 "x509: certificate signed by unknown authority"。
+	// 用 server-side dry-run 建一個 Issuer 當探針（dry-run 一樣會呼叫 webhook），等到它成功為止。
+	probe := `apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: probe, namespace: cert-manager}
+spec: {selfSigned: {}}
+`
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		cmd = exec.Command("kubectl", "apply", "--dry-run=server", "-f", "-")
+		cmd.Stdin = strings.NewReader(probe)
+		_, err := Run(cmd)
+		if err == nil || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
