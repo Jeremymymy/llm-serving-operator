@@ -638,6 +638,17 @@ Event：`Warning  CreateContainerConfigError  ModelDeployment/pricer`（7m1s 前
 
 判讀：落在 $40～$45（LoRA 生效），跟 k8s-lab 手寫 manifest 的 $40.86 差 $0.17、跟 Mac 上直接跑的 $40.79 差 $0.24。operator 組出來的部署沒有改變模型行為。
 
+### Part 8：GitHub Actions（commit `02568c7`，2026-11-23）
+
+| workflow | 結果 | 時間 | Phase 4（`ef6405f`） |
+|---|---|---|---|
+| Lint | ✅ | 1 分 46 秒 | 2 分 0 秒 |
+| Tests | ✅ | 48 秒 | 50 秒 |
+| E2E Tests | ✅ | 4 分 17 秒 | 4 分 33 秒 |
+| Test Chart | ✅ | 2 分 43 秒 | 3 分 20 秒 |
+
+E2E：`Ran 7 of 7 Specs in 197.520 seconds`，**`SUCCESS! -- 7 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`**。e2e 的 smollm 不受 `--cache-ram 0`、`--parallel 4` 影響，跟文件預期一致。
+
 ### 與預期不同（Phase 5）
 
 - **漏改 `availableCondition`，第一次 `make test` 有 1 個失敗**：4.1 只寫「見下面的插曲」，插曲「修法」的兩段程式碼讀起來像說明，沒有被當成步驟。回歸測試確實擋下來了（`Expected True to equal False`）。文件已改成明確的步驟，並註明漏改時哪個測試會失敗

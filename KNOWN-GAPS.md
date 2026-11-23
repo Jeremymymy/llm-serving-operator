@@ -11,10 +11,10 @@
 ## Phase 2 的邊界
 
 - **PVC 是 ReadWriteOnce**：只能被同一個節點上的 pod 掛載。kind 是單節點，所以 2 個 replica 能共用快取（實驗 5）；多節點叢集上，排到別的節點的 pod 會掛載失敗。正式做法是 RWX 儲存（NFS、EFS…）或節點本地的模型快取。
-- **PVC 容量寫死 1Gi**：沒有 spec 欄位可以調整；換模型後舊的模型檔不會被清掉，會一直佔空間。
+- **PVC 容量寫死 1Gi**：沒有 spec 欄位可以調整；換模型後舊的模型檔不會被清掉，會一直佔空間。（Phase 5 已部分解決：`spec.cacheSize` 可以在建立時指定容量，但建立後不能改；舊模型檔仍不會被清掉。）
 - **PVC 跟著 md 一起被 GC 刪掉**：刪 md 或 PVC 被誤刪，快取就沒了，下一個 pod 要重新下載（實驗 8a、8b 約 70 秒）。
 - **`Watches(&corev1.Pod{})` 會 cache 叢集內所有 pod**：大叢集上記憶體可觀。可以在 `cmd/main.go` 用 `cache.Options.ByObject` 只 cache 帶 `managed-by=llm-serving-operator` label 的 pod，這個 lab 沒做。
-- **Degraded 只認得一種失敗**：init container `fetch-model` 非零結束。llama-server 載入失敗、OOMKilled、image 拉不下來，都還只會顯示 `Progressing`。
+- **Degraded 只認得一種失敗**：init container `fetch-model` 非零結束。llama-server 載入失敗、OOMKilled、image 拉不下來，都還只會顯示 `Progressing`。（Phase 5 已部分解決：多認得 `AdapterDownloadFailed` 與 `CreateContainerConfigError`；llama-server 載入失敗、OOMKilled、image 拉不下來仍是 `Progressing`。）
 - **status 的 409 會以 `ERROR Reconciler error` 出現在 log**：插曲 3 加回樂觀鎖後，狀態轉變時偶爾會有一次預期中的 409（實驗 6 有 1 次）。沒有特別處理成安靜重試。
 - **envtest 沒有 cache**：測試用的 client 直接打 API server，cache 落後造成的行為只能用 `staleReader` 手工模擬（插曲 3），或在 kind 上觀察。
 - **PVC 建立後第一次 re-apply 會多寫一次**：envtest 實測內容完全相同、只有 resourceVersion 變，之後就穩定。原因沒有查明。

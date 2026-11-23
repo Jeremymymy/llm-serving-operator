@@ -816,10 +816,10 @@ e2e 不用改：CI 的 runner 下載 4 GB 的模型不實際，MAE 驗收留在�
 
 ## 完成條件
 
-- [ ] `spec.adapter`、`spec.cacheSize` 與兩條 CEL，`make manifests` 後 RBAC 沒有變
-- [ ] controller 改完，`make test` 25 個通過、`make lint` 0 issues
-- [ ] `make helm-deploy` 升級到 v0.0.3
-- [ ] 實驗 1：Secret 不存在時 md 是 `Degraded / CreateContainerConfigError`；補上 Secret 後不動 md 就恢復
-- [ ] 實驗 2：MAE 在 $40～$45，200/200，restartCount 0
-- [ ] GitHub Actions 四個 workflow 都是綠的
-- [ ] RESULTS、KNOWN-GAPS、README 已更新
+- [x] `spec.adapter`、`spec.cacheSize` 與兩條 CEL，`make manifests` 後 RBAC 沒有變
+- [x] controller 改完，`make test` 25 個通過、`make lint` 0 issues
+- [x] `make helm-deploy` 升級到 v0.0.3
+- [x] 實驗 1：Secret 不存在時 md 是 `Degraded / CreateContainerConfigError`；補上 Secret 後不動 md 就恢復
+- [x] 實驗 2：MAE 在 $40～$45，200/200，restartCount 0
+- [x] GitHub Actions 四個 workflow 都是綠的
+- [x] RESULTS、KNOWN-GAPS、README 已更新
