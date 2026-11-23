@@ -102,6 +102,9 @@ var _ = Describe("ModelDeployment Controller", func() {
 		Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
 		Expect(dep.Spec.Template.Spec.Containers[0].Image).To(Equal(defaultLlamaCppImage))
 		Expect(dep.Spec.Template.Spec.Containers[0].Args).To(ContainElement("/models/model.gguf"))
+		Expect(dep.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement("--lora"))
+		Expect(dep.Spec.Template.Spec.Containers[0].Args).To(ContainElements("--cache-ram", "0"))
+		Expect(dep.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 		Expect(dep.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(pvcKey.Name))
 		Expect(metav1.GetControllerOf(dep).UID).To(Equal(md.UID))
 
@@ -113,6 +116,7 @@ var _ = Describe("ModelDeployment Controller", func() {
 		pvc := &corev1.PersistentVolumeClaim{}
 		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
 		Expect(pvc.Spec.AccessModes).To(ConsistOf(corev1.ReadWriteOnce))
+		Expect(pvc.Spec.Resources.Requests.Storage().String()).To(Equal("1Gi"))
 		Expect(metav1.GetControllerOf(pvc).UID).To(Equal(md.UID))
 	})
 
@@ -233,6 +237,29 @@ var _ = Describe("ModelDeployment Controller", func() {
 		Expect(recorder.Events).NotTo(Receive())
 	})
 
+	// docs/06 插曲的回歸測試：滾動更新卡住時，新 pod 算在 UpdatedReplicas、舊 pod 算在 ReadyReplicas，
+	// 兩個數字都「夠」，但新的 spec 沒有任何一個 pod 在服務。
+	It("does not report Available while old pods are still serving a rollout", func() {
+		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
+		reconcileOnce()
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		dep.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: dep.Generation,
+			Replicas:           2, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1, UnavailableReplicas: 1,
+		}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+		reconcileOnce()
+
+		md := &servingv1alpha1.ModelDeployment{}
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		a := meta.FindStatusCondition(md.Status.Conditions, conditionAvailable)
+		Expect(a.Status).To(Equal(metav1.ConditionFalse))
+		Expect(a.Reason).To(Equal("Progressing"))
+		Expect(a.Message).To(Equal("1/1 replicas ready, 1/2 on the latest spec"))
+	})
+
 	// Phase 2 實驗 2 的回歸測試：別人改了 Deployment 的 annotation，Available 不應該閃一下。
 	It("keeps Available when only the Deployment's annotations change", func() {
 		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
@@ -321,27 +348,107 @@ var _ = Describe("ModelDeployment Controller", func() {
 		Expect(recorder.Events).NotTo(Receive())                       // 沒有重複的 Event
 	})
 
-	It("reports Degraded when the model download fails", func() {
+	It("adds an adapter download and --lora, passing the token by Secret reference only", func() {
+		md := newMD()
+		md.Spec.Adapter = &servingv1alpha1.AdapterSource{
+			URL:  "https://example.com/lora.gguf",
+			File: "lora.gguf",
+			TokenSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "hf-token"}, Key: "token",
+			},
+		}
+		md.Spec.CacheSize = new(resource.MustParse("5Gi"))
+		// 刻意不建立 Secret hf-token：controller 不讀它，reconcile 照樣成功。
+		Expect(k8sClient.Create(ctx, md)).To(Succeed())
+		reconcileOnce()
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		spec := dep.Spec.Template.Spec
+		Expect(spec.Containers[0].Args).To(ContainElements("--lora", "/models/lora.gguf"))
+		Expect(spec.InitContainers).To(HaveLen(2))
+		Expect(spec.InitContainers[1].Name).To(Equal("fetch-adapter"))
+		Expect(spec.InitContainers[1].Env).To(ContainElement(corev1.EnvVar{
+			Name: "TOKEN",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "hf-token"}, Key: "token",
+			}},
+		}))
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
+		Expect(pvc.Spec.Resources.Requests.Storage().String()).To(Equal("5Gi"))
+	})
+
+	It("rejects a change to cacheSize", func() {
+		Expect(k8sClient.Create(ctx, newMD())).To(Succeed())
+		md := &servingv1alpha1.ModelDeployment{}
+		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+		md.Spec.CacheSize = new(resource.MustParse("5Gi"))
+		err := k8sClient.Update(ctx, md)
+		Expect(err).To(MatchError(ContainSubstring("cacheSize is immutable")))
+	})
+
+	DescribeTable("reports Degraded when a download fails",
+		func(initContainer, wantReason string) {
+			md := newMD()
+			Expect(k8sClient.Create(ctx, md)).To(Succeed())
+
+			// 扮演 kubelet：做一個 init container 以 exit 22（curl -f 遇到 HTTP 4xx）結束的 pod。
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-abc", Namespace: ns, Labels: labelsFor(md)},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{Name: initContainer, Image: modelFetcherImage}},
+					Containers:     []corev1.Container{{Name: "llama-server", Image: defaultLlamaCppImage}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+				Name:         initContainer,
+				Image:        modelFetcherImage,
+				RestartCount: 2,
+				State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{ExitCode: 22, Reason: "Error"},
+				},
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			reconcileOnce()
+
+			Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
+			d := meta.FindStatusCondition(md.Status.Conditions, conditionDegraded)
+			Expect(d).NotTo(BeNil())
+			Expect(d.Status).To(Equal(metav1.ConditionTrue))
+			Expect(d.Reason).To(Equal(wantReason))
+			Expect(d.Message).To(ContainSubstring(initContainer + " exited with code 22"))
+			a := meta.FindStatusCondition(md.Status.Conditions, conditionAvailable)
+			Expect(a.Reason).To(Equal(wantReason))
+			Expect(recorder.Events).To(Receive(HavePrefix("Warning " + wantReason)))
+		},
+		Entry("model", fetchContainerName, "ModelDownloadFailed"),
+		Entry("adapter", fetchAdapterName, "AdapterDownloadFailed"),
+	)
+
+	// controller 不讀 Secret，所以只能從 pod status 知道 Secret 不存在（docs/06 實驗 1）。
+	It("reports Degraded when kubelet cannot resolve the token Secret", func() {
 		md := newMD()
 		Expect(k8sClient.Create(ctx, md)).To(Succeed())
 
-		// 扮演 kubelet：做一個 init container 以 exit 22（curl -f 遇到 HTTP 4xx）結束的 pod。
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-abc", Namespace: ns, Labels: labelsFor(md)},
 			Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{Name: fetchContainerName, Image: modelFetcherImage}},
+				InitContainers: []corev1.Container{{Name: fetchAdapterName, Image: modelFetcherImage}},
 				Containers:     []corev1.Container{{Name: "llama-server", Image: defaultLlamaCppImage}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
-			Name:         fetchContainerName,
-			Image:        modelFetcherImage,
-			RestartCount: 2,
-			State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
-			LastTerminationState: corev1.ContainerState{
-				Terminated: &corev1.ContainerStateTerminated{ExitCode: 22, Reason: "Error"},
-			},
+			Name:  fetchAdapterName,
+			Image: modelFetcherImage,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: "CreateContainerConfigError", Message: `secret "hf-token" not found`,
+			}},
 		}}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 
@@ -349,13 +456,9 @@ var _ = Describe("ModelDeployment Controller", func() {
 
 		Expect(k8sClient.Get(ctx, key, md)).To(Succeed())
 		d := meta.FindStatusCondition(md.Status.Conditions, conditionDegraded)
-		Expect(d).NotTo(BeNil())
 		Expect(d.Status).To(Equal(metav1.ConditionTrue))
-		Expect(d.Reason).To(Equal("ModelDownloadFailed"))
-		Expect(d.Message).To(ContainSubstring("exited with code 22"))
-		a := meta.FindStatusCondition(md.Status.Conditions, conditionAvailable)
-		Expect(a.Reason).To(Equal("ModelDownloadFailed"))
-		Expect(recorder.Events).To(Receive(HavePrefix("Warning ModelDownloadFailed")))
+		Expect(d.Reason).To(Equal("CreateContainerConfigError"))
+		Expect(d.Message).To(ContainSubstring(`fetch-adapter: secret "hf-token" not found`))
 	})
 
 	DescribeTable("rejects invalid specs at the API server",
@@ -370,6 +473,9 @@ var _ = Describe("ModelDeployment Controller", func() {
 		Entry("plain http url", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Model.URL = "http://example.com/m.gguf" }),
 		Entry("unknown runtime", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Runtime = "vllm" }),
 		Entry("negative replicas", func(md *servingv1alpha1.ModelDeployment) { md.Spec.Replicas = ptr.To[int32](-1) }),
+		Entry("adapter with the same file name as the model", func(md *servingv1alpha1.ModelDeployment) {
+			md.Spec.Adapter = &servingv1alpha1.AdapterSource{URL: "https://example.com/a.gguf", File: md.Spec.Model.File}
+		}),
 		Entry("memory request above limit", func(md *servingv1alpha1.ModelDeployment) {
 			md.Spec.Resources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},

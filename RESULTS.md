@@ -538,3 +538,109 @@ dial tcp 10.96.202.56:443: connect: connection refused
 
 - **實驗 1 的 Events 不是一直空的**：文件只寫 `No events found`；`sleep 6` 時確實是空的，但再查一次多了 `Normal  Available  1/1 replicas ready`。md 不只沒報錯，還回報成功（文件已補充）
 - **`kubebuilder edit --plugins=helm/v2-alpha --force` 也改了 `config/manager/kustomization.yaml`**：文件 4.3 的預期清單沒有列。Phase 3 commit 時這個檔案只有 `resources: [manager.yaml]`，這次 plugin 內部跑 `make build-installer`，`kustomize edit set image` 加上了 `newTag: v0.0.2`。跟 Phase 3 一樣，commit 前還原（文件已補充）
+
+## Phase 5：把 k8s-lab 的 pricer 交給 operator（LoRA adapter 與 MAE 驗收）
+
+### Part 3：API
+
+**3.1 `make manifests generate`**（2026-11-23）：`git diff --stat config/` 只有 `config/crd/bases/serving.llmlab.dev_modeldeployments.yaml`（**+55 行**），`config/rbac/role.yaml` **沒有變更**，跟文件預期一致。
+
+- 新增 `spec.adapter`（`url`、`file`、`tokenSecretRef`）與 `spec.cacheSize`（`default: 1Gi`）
+- 兩條 `x-kubernetes-validations`：`spec.cacheSize` 上的 `self == oldSelf`（`cacheSize is immutable`），以及 `spec` 上的 `!has(self.adapter) || self.adapter.file != self.model.file`
+
+### Part 5：測試
+
+**第一次 `make test`：1 個失敗（漏改 `availableCondition`）**（2026-11-23）：
+
+| 項目 | 結果 |
+|---|---|
+| `internal/controller` | `Ran 25 of 25 Specs`，**`FAIL! -- 24 Passed \| 1 Failed`**，覆蓋率 84.1% |
+| 失敗的測試 | `does not report Available while old pods are still serving a rollout`：`Expected <v1.ConditionStatus>: True to equal False` |
+| `internal/webhook/v1alpha1` | `ok`，80.0% |
+| `make lint` | `0 issues.` |
+
+原因：4.1 只寫「`availableCondition`：見下面的插曲」，插曲裡「修法」的兩段程式碼沒有被當成要做的步驟。舊的判斷 `UpdatedReplicas >= desired && ReadyReplicas >= desired` 對 `Replicas: 2, UpdatedReplicas: 1, ReadyReplicas: 1` 回報 True，跟插曲描述的誤判相同 —— 回歸測試在修正前確實會失敗。
+
+**改完 `availableCondition` 之後**：
+
+| 項目 | 結果 |
+|---|---|
+| `make test` | `internal/controller` `ok`（10.6 秒），覆蓋率 **85.6%**；`internal/webhook/v1alpha1` `ok`，**80.0%**（不變） |
+| `go test ./internal/controller/ -v` | `Ran 25 of 25 Specs in 9.543 seconds`，**`SUCCESS! -- 25 Passed \| 0 Failed \| 0 Pending \| 0 Skipped`**（19 + 6） |
+| `make lint` | `0 issues.` |
+
+跟文件預期完全一致（25 個、85.6%、0 issues）。
+
+### Part 6：部署 v0.0.3
+
+（2026-11-23，`operator-lab`，叢集上沒有任何 md）
+
+| 項目 | 結果 |
+|---|---|
+| `make docker-build` | 22.6 秒（`go build` 18.3 秒，`go mod download` 用 cache） |
+| `git status --short`（不算文件和 Go 檔） | `M config/manager/kustomization.yaml`（`newTag: v0.0.3`）、`M dist/chart/templates/crd/...`（+55）、`M dist/chart/values.yaml`（`v0.0.2` → `v0.0.3`）、`M dist/install.yaml`（+57 −2）。**沒有** RBAC 或 webhook 的變更，跟文件預期一致 |
+| `make helm-deploy` | 14:54:49 → 14:55:02，**13 秒**，`REVISION: 3`、`STATUS: deployed` |
+
+> `config/manager/kustomization.yaml` 跟 Phase 4 一樣，commit 前還原。
+
+### Part 7：建立 pricer 並驗收
+
+**實驗 1：Secret 還不存在時建立 md**（2026-11-23）
+
+| 時間 | pod 狀態 |
+|---|---|
+| 15:04:18 | `kubectl apply` → `modeldeployment.serving.llmlab.dev/pricer created`（沒有遇到 webhook 的 `connection refused`） |
+| +0～4 秒 | `Pending`（等 PVC） |
+| +4 秒 | `Init:0/2`（`fetch-model` 開始下載 base） |
+| 約 +22 分 | `Init:1/2` → 緊接著 `Init:CreateContainerConfigError` |
+
+- base（3.2 GB）下載約 22 分鐘，落在文件記錄的慢的那一端（2 分 22 秒～22 分 46 秒）
+
+**md 的回報**（15:33:58，base 下載完約 7 分鐘後）：
+
+```
+Available=False CreateContainerConfigError: pod pricer-f46f5665-48m6w: fetch-adapter: secret "hf-token" not found
+Degraded=True CreateContainerConfigError: pod pricer-f46f5665-48m6w: fetch-adapter: secret "hf-token" not found
+```
+
+Event：`Warning  CreateContainerConfigError  ModelDeployment/pricer`（7m1s 前，只有一筆）。pod 的 Events 裡，kubelet 在 19 分鐘內重試了 26 次（`Error: secret "hf-token" not found` x26）。跟文件預期一致。
+
+**補上 Secret 之後（不動 md）**：
+
+| 時間（+08:00） | 事件 |
+|---|---|
+| 15:36:12 | `secret/hf-token created` |
+| 15:36:20 | `fetch-adapter` 開始（**Secret 建立後 8 秒**，kubelet 自己重試）；Degraded 轉成 `False NoFailure` |
+| 15:41:13 | `fetch-adapter` 結束：742 MB 花了 **4 分 53 秒**（約 2.5 MB/s，exit 0，restarts 0） |
+| 15:41:14 | llama-server 啟動 |
+| 15:41:22 | md `Available=True AllReplicasReady`（從建 Secret 算起 5 分 10 秒） |
+
+- `kubectl wait --timeout=5m` 在 15:41:12 **逾時**，比 Available 早 10 秒（文件已改成 `--timeout=10m`）
+- llama-server log 有 **196 行** `llama_adapter_lora_init_impl`（第一行：`lora for 'blk.0.attn_k.weight' cannot use buft 'CPU_REPACK', fallback to CPU`）：adapter 有被載入
+- 初始化期間有一次 `Startup probe failed: HTTP probe failed with statuscode: 503`：模型還在載入，屬於正常
+- init container 時間：`fetch-model` 07:04:23Z → 07:26:44Z（3.2 GB，**22 分 21 秒**）；`fetch-adapter` 07:36:20Z → 07:41:13Z
+
+**實驗 2：MAE 驗收**（2026-11-23，15:51:38 → 15:57:46，同一個 pod，跑一次）：
+
+| 項目 | 結果 |
+|---|---|
+| 成功 | **200/200**，失敗 0 |
+| MAE | **$41.03**（跟寫文件時的兩次逐位元相同） |
+| RMSE | $78.63 |
+| R² / Hit rate | 71.9% / 75.0% |
+| 延遲 p50 / p95 / p99 | 9,173 / 10,909 / 11,112 ms |
+| 總耗時 | 363.4 秒（0.6 req/s @ workers=5） |
+| llama-server restartCount | **0** |
+
+| label | MAE | R² | Hit rate | p50 (ms) | p95 (ms) | req/s |
+|---|---|---|---|---|---|---|
+| operator-llamacpp-q8-lora | $41.03 | 71.9% | 75.0% | 9173 | 10909 | 0.6 |
+
+判讀：落在 $40～$45（LoRA 生效），跟 k8s-lab 手寫 manifest 的 $40.86 差 $0.17、跟 Mac 上直接跑的 $40.79 差 $0.24。operator 組出來的部署沒有改變模型行為。
+
+### 與預期不同（Phase 5）
+
+- **漏改 `availableCondition`，第一次 `make test` 有 1 個失敗**：4.1 只寫「見下面的插曲」，插曲「修法」的兩段程式碼讀起來像說明，沒有被當成步驟。回歸測試確實擋下來了（`Expected True to equal False`）。文件已改成明確的步驟，並註明漏改時哪個測試會失敗
+- **base 下載完後 pod 會閃過 `Init:1/2`**：文件原本只寫 `Init:0/2` 接著 `Init:CreateContainerConfigError`（文件已補充）
+- **`kubectl wait --timeout=5m` 逾時**：adapter 下載碰上慢的那一端（4 分 53 秒，跟寫文件時慢的那次一樣），從建 Secret 到 Available 5 分 10 秒，逾時後 10 秒 md 就 Available 了。逾時當下跑的後續指令拿到空的 `fetch-adapter` 時間、`PodInitializing` 和 `0` 行 LoRA log，看起來像失敗。文件已改成 `--timeout=10m`
+- **base 下載 22 分 21 秒**：落在文件記錄範圍的最慢端（2 分 22 秒～22 分 46 秒），HF 當下的速度決定一切

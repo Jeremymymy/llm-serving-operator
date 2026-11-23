@@ -56,7 +56,7 @@
 | Phase 2 | [`docs/03-phase2-trustworthy-controller.md`](docs/03-phase2-trustworthy-controller.md) | controller 的可信度：Server-Side Apply、status 樂觀鎖與 predicate、PVC 模型快取、Degraded condition 與 Events、finalizer 的效果與風險（實驗） | ✅ |
 | Phase 3 | [`docs/04-phase3-in-cluster.md`](docs/04-phase3-in-cluster.md) | 上叢集：多階段 Dockerfile、RBAC 最小權限驗證、`make deploy`、Helm chart、GitHub Actions | ✅ |
 | Phase 4 | [`docs/05-phase4-admission.md`](docs/05-phase4-admission.md) | Admission：CEL 驗證 vs validating webhook（cert-manager）、validation ratcheting、webhook 停機與 HA 的行為 | ✅ |
-| Phase 5 | （選做） | 接上 k8s-lab 的 pricer 模型（LoRA adapter），用 MAE 驗收（不做 HPA） | ⬜ |
+| Phase 5 | [`docs/06-phase5-lora-mae.md`](docs/06-phase5-lora-mae.md) | 把 k8s-lab 手寫的 pricer 部署交給 operator：LoRA adapter（私有 repo + Secret 參照）、CEL transition rule、用 MAE 驗收跟手寫版一致（不做 HPA） | ✅ |
 
 ---
 
@@ -64,7 +64,7 @@
 
 > 做到哪裡就填到哪裡。**沒量過的不要填。** 完整紀錄在 [`RESULTS.md`](RESULTS.md)。
 
-環境：kind v0.33.0（Kubernetes v1.37.0）、kubebuilder v4.16.0、controller-runtime v0.25.0，MacBook Air（darwin/arm64，只用 CPU）。
+環境：kind v0.33.0（Kubernetes v1.37.0）、kubebuilder v4.16.0、controller-runtime v0.25.0，MacBook Air（darwin/arm64，只用 CPU），OrbStack 記憶體上限 16 GiB。
 
 | 指標 | Phase 1 | Phase 2 |
 |---|---|---|
@@ -106,6 +106,22 @@
 | webhook 延遲（讀 informer cache） | 平均約 10.7 毫秒（寫文件時 20 個請求實測） |
 | envtest 測試／覆蓋率 | `internal/controller` 19 個／83.0%；`internal/webhook` 8 個／80.0% |
 | e2e（7 個測試，含撞名、CA 注入） | GitHub Actions 4 分 33 秒 |
+
+**Phase 5：把 k8s-lab 的 pricer 交給 operator（Llama-3.2-3B Q8_0 + QLoRA adapter）**
+
+| 指標 | 結果 |
+|---|---|
+| 部署方式 | 216 行手寫 manifest＋手動 `kubectl cp` adapter → 一個約 20 行的 ModelDeployment |
+| MAE（200 筆） | operator **$41.03**；k8s-lab 手寫 manifest $40.86；Mac 上直接跑 $40.79；operator 不掛 adapter $195.56（寫文件時實測） |
+| RBAC | 加了私有 adapter 下載，**0 個 verb 變更**（token 只以 `secretKeyRef` 傳給 pod，controller 不讀 Secret） |
+| token Secret 不存在時的回報 | `Degraded / CreateContainerConfigError: ... secret "hf-token" not found`（之前會一直是 `Progressing`）；補上 Secret 後不動 md，8 秒內 kubelet 自己重試 |
+| 冷啟動（依序下載） | base 3.2 GB 22 分 21 秒＋adapter 742 MB 4 分 53 秒（HF 速度，寫文件時快的一次合計約 3 分鐘） |
+| 記憶體（cgroup anon） | base＋LoRA 4.22 GiB，連跑兩次 MAE 後 4.26 GiB（`--cache-ram 0`，寫文件時實測） |
+| LoRA 的延遲代價 | p50 5,094 ms → **9,173 ms**，吞吐約減半（LoRA 張量用不了 `CPU_REPACK`） |
+| envtest 測試／覆蓋率 | `internal/controller` 25 個／85.6%；`internal/webhook` 8 個／80.0% |
+
+- 在叢集上找到一個從 Phase 1 就存在的 status 誤判：滾動更新卡住時，「新 pod 算在 UpdatedReplicas、舊 pod 算在 ReadyReplicas」湊成 `Available=True`，服務的卻是沒有 LoRA 的舊 pod。先寫回歸測試再修（`docs/06` 插曲）
+- operator 降版會默默拿掉 LoRA、md 仍回報 `Available=True`：沒有修，列在 KNOWN-GAPS
 
 ---
 

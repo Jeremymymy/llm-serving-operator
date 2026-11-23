@@ -40,3 +40,16 @@
 - **`Chart.yaml` 的版本沒有跟著 image 升級**：`version: 0.1.0`、`appVersion` 都沒動，`helm history` 分不出 v0.0.1 和 v0.0.2。
 - **`test-chart.yml` 裝 cert-manager 沒有釘版本**：CI 實際裝到 v1.21.3，e2e 固定 v1.21.1，兩個 workflow 已經在用不同版本。
 - **PVC 名稱規則（`<name>-models`）有兩份**：webhook 和 controller 的 `pvcName()` 各寫一次，改一邊要記得改另一邊。
+
+## Phase 5 的邊界
+
+- **換 adapter 的滾動更新要兩倍記憶體**：新舊 pod 會同時存在（`maxSurge` 1 個），operator 沒有 `strategy: Recreate` 欄位；節點只放得下一個 pod 時，新 pod 會一直 Pending。
+- **operator 降版會默默拿掉 LoRA**：舊版 controller 不認得 `spec.adapter`，SSA 送出的 Deployment 就沒有 `--lora`、沒有 `fetch-adapter`，md 卻仍回報 `Available=True`，MAE 回到 $200 上下（`docs/06` 7.5）。正式做法是讓 CRD 欄位搭配 controller 最低版本，或在 status 寫出 controller 處理過哪些欄位。
+- **換 adapter 版本一定要換檔名**：只改 URL 不改 `file`，快取裡的舊檔會被當成「已經存在」；也沒有 checksum 驗證檔案內容。
+- **`--cache-ram 0`、`--parallel 4` 寫死在 operator 裡**：所有 md 共用，operator 一升級就全部滾動重啟（`docs/06` 6.1）；沒有 `extraArgs` 之類的逃生口。
+- **只支援一個 adapter**：llama.cpp 可以掛多個 `--lora`，vLLM 可以依 request 選 adapter，這裡都沒做。
+- **`cacheSize` 在 kind 上只是宣告**：local-path provisioner 不限制容量（1Gi 的 PVC 放得下 3.2 GB）；`self == oldSelf` 比的是原始值，`5Gi` 改成 `5120Mi` 也會被拒。
+- **MAE 驗收是手動的**：沒有進 CI（runner 下載 4 GB 不實際）；跟 k8s-lab 差 $0.17～$0.24，剩下的差別（llama.cpp 版本沒有釘、並發數不同）沒有在同一個環境對照。
+- **Secret 的錯誤只能事後從 pod status 發現**：controller 刻意不讀 Secret（`docs/06` 1.2 的取捨），要等 base 下載完、`fetch-adapter` 要啟動時才知道 Secret 不存在（實驗 1 等了約 22 分鐘）。
+- **冷啟動很慢**：base 3.2 GB＋adapter 742 MB 依序下載，實測 22 分 21 秒＋4 分 53 秒；init container 依序執行，不能平行下載。
+

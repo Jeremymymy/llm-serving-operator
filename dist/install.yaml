@@ -66,6 +66,58 @@ spec:
           spec:
             description: spec defines the desired state of ModelDeployment
             properties:
+              adapter:
+                description: Adapter 是套在 model 上的 LoRA adapter。不寫就只跑 base model。
+                properties:
+                  file:
+                    description: File 是存進 /models 底下的檔名，規則跟 model.file 一樣。
+                    pattern: ^[A-Za-z0-9._-]+\.gguf$
+                    type: string
+                  tokenSecretRef:
+                    description: |-
+                      TokenSecretRef 指向同一個 namespace 裡 Secret 的某個 key，內容是下載用的 bearer token（私有 repo 用）。
+                      controller 不讀這個 Secret：它只把參照寫進 pod，由 kubelet 在啟動 init container 時解析。
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  url:
+                    description: URL 是 adapter GGUF 的下載位址。只接受 https。
+                    pattern: ^https://
+                    type: string
+                required:
+                - file
+                - url
+                type: object
+              cacheSize:
+                anyOf:
+                - type: integer
+                - type: string
+                default: 1Gi
+                description: CacheSize 是模型快取 PVC 的容量，要放得下 model 加 adapter。建立後不能改。
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: cacheSize is immutable
+                  rule: self == oldSelf
               image:
                 description: Image 覆蓋預設的推論 image。
                 type: string
@@ -166,6 +218,9 @@ spec:
             required:
             - model
             type: object
+            x-kubernetes-validations:
+            - message: adapter.file must differ from model.file
+              rule: '!has(self.adapter) || self.adapter.file != self.model.file'
           status:
             description: status defines the observed state of ModelDeployment
             properties:
@@ -574,7 +629,7 @@ spec:
         - --webhook-port=9443
         command:
         - /manager
-        image: llm-serving-operator:v0.0.2
+        image: llm-serving-operator:v0.0.3
         livenessProbe:
           httpGet:
             path: /healthz

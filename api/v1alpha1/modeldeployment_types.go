@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -37,7 +38,24 @@ type ModelSource struct {
 	File string `json:"file"`
 }
 
+// AdapterSource 描述 LoRA adapter（GGUF）從哪裡來。
+type AdapterSource struct {
+	// URL 是 adapter GGUF 的下載位址。只接受 https。
+	// +kubebuilder:validation:Pattern=`^https://`
+	URL string `json:"url"`
+
+	// File 是存進 /models 底下的檔名，規則跟 model.file 一樣。
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]+\.gguf$`
+	File string `json:"file"`
+
+	// TokenSecretRef 指向同一個 namespace 裡 Secret 的某個 key，內容是下載用的 bearer token（私有 repo 用）。
+	// controller 不讀這個 Secret：它只把參照寫進 pod，由 kubelet 在啟動 init container 時解析。
+	// +optional
+	TokenSecretRef *corev1.SecretKeySelector `json:"tokenSecretRef,omitempty"`
+}
+
 // ModelDeploymentSpec 是使用者宣告的期望狀態。
+// +kubebuilder:validation:XValidation:rule="!has(self.adapter) || self.adapter.file != self.model.file",message="adapter.file must differ from model.file"
 type ModelDeploymentSpec struct {
 	// Runtime 是推論引擎。目前只支援 llamacpp。
 	// +kubebuilder:validation:Enum=llamacpp
@@ -47,6 +65,16 @@ type ModelDeploymentSpec struct {
 
 	// Model 是要載入的模型。
 	Model ModelSource `json:"model"`
+
+	// Adapter 是套在 model 上的 LoRA adapter。不寫就只跑 base model。
+	// +optional
+	Adapter *AdapterSource `json:"adapter,omitempty"`
+
+	// CacheSize 是模型快取 PVC 的容量，要放得下 model 加 adapter。建立後不能改。
+	// +kubebuilder:default="1Gi"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="cacheSize is immutable"
+	// +optional
+	CacheSize *resource.Quantity `json:"cacheSize,omitempty"`
 
 	// Replicas 是推論 pod 數量。可以是 0（停用但保留設定）。
 	// +kubebuilder:validation:Minimum=0

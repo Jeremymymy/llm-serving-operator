@@ -53,6 +53,7 @@ const (
 	modelsDir            = "/models"
 	modelCacheSize       = "1Gi"
 	fetchContainerName   = "fetch-model"
+	fetchAdapterName     = "fetch-adapter"
 
 	// fieldOwner 是 SSA 的 field manager 名稱。managedFields 裡會看到它。
 	fieldOwner = client.FieldOwner("llm-serving-operator")
@@ -206,7 +207,15 @@ func desiredPVC(md *servingv1alpha1.ModelDeployment, owner *metav1ac.OwnerRefere
 		WithSpec(corev1ac.PersistentVolumeClaimSpec().
 			WithAccessModes(corev1.ReadWriteOnce).
 			WithResources(corev1ac.VolumeResourceRequirements().
-				WithRequests(corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(modelCacheSize)})))
+				WithRequests(corev1.ResourceList{corev1.ResourceStorage: cacheSize(md)})))
+}
+
+// cacheSize：CRD 的 default 會在寫入時補上 1Gi，這裡的備案只給沒經過 API server 的物件（單元測試）用。
+func cacheSize(md *servingv1alpha1.ModelDeployment) resource.Quantity {
+	if md.Spec.CacheSize == nil {
+		return resource.MustParse(modelCacheSize)
+	}
+	return *md.Spec.CacheSize
 }
 
 // fetchScript：先下載到 pod 專屬的暫存檔，再 mv（同一個檔案系統內是原子操作）。
@@ -219,6 +228,20 @@ curl -fL --retry 3 --retry-delay 5 -o "$tmp" "$MODEL_URL"
 mv "$tmp" "/models/$MODEL_FILE"
 ls -lh /models`
 
+// fetchAdapterScript 跟 fetchScript 一樣先下載到暫存檔再 mv，多了選用的 bearer token。
+// token 從 stdin 交給 curl（-K -），不放在命令列：命令列參數在節點上用 ps 看得到。
+const fetchAdapterScript = `set -eu
+if [ -f "/models/$ADAPTER_FILE" ]; then echo "adapter already present"; exit 0; fi
+tmp="/models/$ADAPTER_FILE.partial.$POD_NAME"
+trap 'rm -f "$tmp"' EXIT
+if [ -n "${TOKEN:-}" ]; then
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fL --retry 3 --retry-delay 5 -K - -o "$tmp" "$ADAPTER_URL"
+else
+  curl -fL --retry 3 --retry-delay 5 -o "$tmp" "$ADAPTER_URL"
+fi
+mv "$tmp" "/models/$ADAPTER_FILE"
+ls -lh /models`
+
 func desiredDeployment(md *servingv1alpha1.ModelDeployment, owner *metav1ac.OwnerReferenceApplyConfiguration) *appsv1ac.DeploymentApplyConfiguration {
 	labels := labelsFor(md)
 	image := md.Spec.Image
@@ -226,6 +249,52 @@ func desiredDeployment(md *servingv1alpha1.ModelDeployment, owner *metav1ac.Owne
 		image = defaultLlamaCppImage
 	}
 	modelsMount := corev1ac.VolumeMount().WithName("models").WithMountPath(modelsDir)
+
+	podName := corev1ac.EnvVar().WithName("POD_NAME").WithValueFrom(corev1ac.EnvVarSource().
+		WithFieldRef(corev1ac.ObjectFieldSelector().WithFieldPath("metadata.name")))
+
+	initContainers := []*corev1ac.ContainerApplyConfiguration{corev1ac.Container().
+		WithName(fetchContainerName).
+		WithImage(modelFetcherImage).
+		WithEnv(
+			corev1ac.EnvVar().WithName("MODEL_URL").WithValue(md.Spec.Model.URL),
+			corev1ac.EnvVar().WithName("MODEL_FILE").WithValue(md.Spec.Model.File),
+			podName,
+		).
+		WithCommand("sh", "-c", fetchScript).
+		WithVolumeMounts(modelsMount)}
+	args := []string{
+		"--model", modelsDir + "/" + md.Spec.Model.File,
+		"--host", "0.0.0.0",
+		"--port", strconv.Itoa(servingPort),
+		"--ctx-size", "2048",
+		// 4 個 slot 平分 2048：每個 512 token，估價的 prompt 約 150。跟 k8s-lab 一樣，MAE 才能直接比。
+		"--parallel", "4",
+		"--metrics",
+		// prompt cache 預設最多 8 GiB、不會釋放；估價的 prompt 幾乎不重複，開著只會一路漲到 OOMKilled（k8s-lab 實測過，docs/06 4.2）。
+		"--cache-ram", "0",
+	}
+	if a := md.Spec.Adapter; a != nil {
+		env := []*corev1ac.EnvVarApplyConfiguration{
+			corev1ac.EnvVar().WithName("ADAPTER_URL").WithValue(a.URL),
+			corev1ac.EnvVar().WithName("ADAPTER_FILE").WithValue(a.File),
+			podName,
+		}
+		if ref := a.TokenSecretRef; ref != nil {
+			sel := corev1ac.SecretKeySelector().WithName(ref.Name).WithKey(ref.Key)
+			if ref.Optional != nil {
+				sel.WithOptional(*ref.Optional)
+			}
+			env = append(env, corev1ac.EnvVar().WithName("TOKEN").WithValueFrom(corev1ac.EnvVarSource().WithSecretKeyRef(sel)))
+		}
+		initContainers = append(initContainers, corev1ac.Container().
+			WithName(fetchAdapterName).
+			WithImage(modelFetcherImage).
+			WithEnv(env...).
+			WithCommand("sh", "-c", fetchAdapterScript).
+			WithVolumeMounts(modelsMount))
+		args = append(args, "--lora", modelsDir+"/"+a.File)
+	}
 
 	return appsv1ac.Deployment(md.Name, md.Namespace).
 		WithLabels(labels).
@@ -238,28 +307,11 @@ func desiredDeployment(md *servingv1alpha1.ModelDeployment, owner *metav1ac.Owne
 				WithLabels(labels).
 				WithSpec(corev1ac.PodSpec().
 					WithAutomountServiceAccountToken(false).
-					WithInitContainers(corev1ac.Container().
-						WithName(fetchContainerName).
-						WithImage(modelFetcherImage).
-						WithEnv(
-							corev1ac.EnvVar().WithName("MODEL_URL").WithValue(md.Spec.Model.URL),
-							corev1ac.EnvVar().WithName("MODEL_FILE").WithValue(md.Spec.Model.File),
-							corev1ac.EnvVar().WithName("POD_NAME").WithValueFrom(corev1ac.EnvVarSource().
-								WithFieldRef(corev1ac.ObjectFieldSelector().WithFieldPath("metadata.name"))),
-						).
-						WithCommand("sh", "-c", fetchScript).
-						WithVolumeMounts(modelsMount)).
+					WithInitContainers(initContainers...).
 					WithContainers(corev1ac.Container().
 						WithName("llama-server").
 						WithImage(image).
-						WithArgs(
-							"--model", modelsDir+"/"+md.Spec.Model.File,
-							"--host", "0.0.0.0",
-							"--port", strconv.Itoa(servingPort),
-							"--ctx-size", "2048",
-							"--parallel", "2",
-							"--metrics",
-						).
+						WithArgs(args...).
 						WithPorts(corev1ac.ContainerPort().WithName("http").WithContainerPort(servingPort)).
 						WithStartupProbe(httpProbe(5, 60)).
 						WithReadinessProbe(httpProbe(5, 3)).
@@ -343,14 +395,24 @@ func availableCondition(md *servingv1alpha1.ModelDeployment, dep *appsv1.Deploym
 			return *current
 		}
 		c.Status, c.Reason, c.Message = metav1.ConditionFalse, "Progressing", "waiting for deployment controller to observe the latest spec"
-	case dep.Status.UpdatedReplicas >= desired && dep.Status.ReadyReplicas >= desired:
+	// Replicas == UpdatedReplicas：舊 ReplicaSet 的 pod 都走了。少了這個條件，滾動更新卡住時
+	// 「新 pod 算在 UpdatedReplicas、舊 pod 算在 ReadyReplicas」會湊成 True（docs/06 插曲）。
+	case dep.Status.UpdatedReplicas >= desired && dep.Status.Replicas == dep.Status.UpdatedReplicas &&
+		dep.Status.ReadyReplicas >= desired:
 		c.Status, c.Reason = metav1.ConditionTrue, "AllReplicasReady"
 		c.Message = fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, desired)
 	default:
 		c.Status, c.Reason = metav1.ConditionFalse, "Progressing"
-		c.Message = fmt.Sprintf("%d/%d replicas ready", dep.Status.ReadyReplicas, desired)
+		c.Message = fmt.Sprintf("%d/%d replicas ready, %d/%d on the latest spec",
+			dep.Status.ReadyReplicas, desired, dep.Status.UpdatedReplicas, dep.Status.Replicas)
 	}
 	return c
+}
+
+// downloadFailureReasons：哪個 init container 失敗，對應到哪個 Degraded reason。
+var downloadFailureReasons = map[string]string{
+	fetchContainerName: "ModelDownloadFailed",
+	fetchAdapterName:   "AdapterDownloadFailed",
 }
 
 // degradedCondition 看 pod 的 init container：下載失敗是 Deployment status 看不出來的領域知識。
@@ -361,8 +423,16 @@ func degradedCondition(md *servingv1alpha1.ModelDeployment, pods []corev1.Pod) m
 	}
 	for _, p := range pods {
 		for _, s := range p.Status.InitContainerStatuses {
-			if s.Name != fetchContainerName {
+			reason, ok := downloadFailureReasons[s.Name]
+			if !ok {
 				continue
+			}
+			// kubelet 解析不了 env（例如 tokenSecretRef 指向的 Secret 不存在）：container 根本沒啟動。
+			// controller 不讀 Secret，只能從這裡知道。Secret 補上後 kubelet 會自己重試。
+			if w := s.State.Waiting; w != nil && w.Reason == "CreateContainerConfigError" {
+				c.Status, c.Reason = metav1.ConditionTrue, w.Reason
+				c.Message = fmt.Sprintf("pod %s: %s: %s", p.Name, s.Name, w.Message)
+				return c
 			}
 			// 先看目前狀態；正在重試（Running/Waiting）時才回頭看上一次的結束狀態。
 			t := s.State.Terminated
@@ -370,8 +440,8 @@ func degradedCondition(md *servingv1alpha1.ModelDeployment, pods []corev1.Pod) m
 				t = s.LastTerminationState.Terminated
 			}
 			if t != nil && t.ExitCode != 0 {
-				c.Status, c.Reason = metav1.ConditionTrue, "ModelDownloadFailed"
-				c.Message = fmt.Sprintf("pod %s: %s exited with code %d (restarts: %d)", p.Name, fetchContainerName, t.ExitCode, s.RestartCount)
+				c.Status, c.Reason = metav1.ConditionTrue, reason
+				c.Message = fmt.Sprintf("pod %s: %s exited with code %d (restarts: %d)", p.Name, s.Name, t.ExitCode, s.RestartCount)
 				return c
 			}
 		}
